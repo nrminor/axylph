@@ -1,12 +1,11 @@
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{pin::Pin, sync::Arc};
 
-use arrow_flight::decode::FlightRecordBatchStream;
-use arrow_flight::error::FlightError;
-use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
+    decode::FlightRecordBatchStream,
+    error::FlightError,
+    flight_service_server::{FlightService, FlightServiceServer},
 };
 use arrow_ipc::MessageHeader;
 use arrow_schema::Schema;

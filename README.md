@@ -59,6 +59,12 @@ mise run ci-validate
 
 `check` runs formatting, Clippy, nextest, documentation checks, and doctests when `src/lib.rs` exists. Tests exercise the client/server interface and public Flight input handling. Build and verification tasks use `Cargo.lock` without updating dependencies.
 
+`.gitignore` denies files by default. Add each source, test, or configuration file to its allowlist when it should be tracked. Keep imports from the same root in one `use` statement.
+
+The library returns `axylph::Error`, defined with `thiserror` in `src/error.rs`. Application failures have named variants; dependency failures wrap their source errors. The CLI installs `color-eyre` for reporting and adds file or address context. Library callers do not need to install a reporting handler.
+
+Dependencies serve specific roles: Arrow and Flight handle structured reads and IPC, Tonic and Axum serve HTTP/2, and Tokio plus stream adapters provide bounded asynchronous transfer. `seq_io` bounds FASTQ parsing; `flate2` handles gzip, including concatenated members. Serde and JSON encode the progress wire format. Clap handles CLI parsing and help. Replacing these libraries means taking on their behavior and maintenance, not just removing package names. Optional tracing-span capture in `color-eyre` is disabled because the application does not set up tracing spans.
+
 Use `mise run bc`, `mise run bb`, or `mise run bn` to watch checks, builds, or tests with Bacon. Mise enables mr-boxington for Rust builds. Use `mise run mt` to inspect its activity. These settings do not by themselves prove cache hits.
 
 ## Upstream reference

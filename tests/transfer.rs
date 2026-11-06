@@ -1,15 +1,16 @@
 //! Read transfer through the same client and server interfaces used by applications.
 
-use std::collections::HashMap;
-use std::io::{Cursor, Write};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    io::{Cursor, Write},
+    sync::Arc,
+};
 
 use arrow_array::{BinaryArray, RecordBatch};
-use arrow_flight::FlightClient;
-use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::{FlightClient, encode::FlightDataEncoderBuilder};
 use arrow_schema::{DataType, Field, Schema};
 use axum::{Router, body::Body, http::Response, routing::post};
-use axylph::{Client, Limits, Progress, Receiver};
+use axylph::{Client, Error, Limits, Progress, Receiver};
 use flate2::{Compression, write::GzEncoder};
 use futures_util::{StreamExt, stream};
 use tokio::net::TcpListener;
@@ -167,6 +168,44 @@ async fn does_not_trust_an_early_completion_from_a_peer() {
         );
         assert!(!completed);
     }
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn preserves_local_input_errors_through_flight() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, Receiver::new(Limits::default()).router())
+            .await
+            .unwrap();
+    });
+    let client = Client::new(format!("http://{address}"), Limits::new(10, 1).unwrap());
+    let error = client
+        .send(Cursor::new(b"@broken\nACGT\n"), |progress| {
+            assert!(!progress.complete);
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Fastq(_)), "{error:?}");
+
+    let error = client
+        .send(Cursor::new(b"@long\nACGT\n+\nIIII\n"), |progress| {
+            assert!(!progress.complete);
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Error::ReadTooLarge {
+                bytes: 12,
+                limit: 10
+            }
+        ),
+        "{error:?}"
+    );
     server.abort();
     let _ = server.await;
 }

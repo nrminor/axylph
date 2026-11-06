@@ -19,6 +19,7 @@
 # Source and tests
 !/src/
 !/src/client.rs
+!/src/error.rs
 !/src/lib.rs
 !/src/main.rs
 !/src/protocol.rs

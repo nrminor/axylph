@@ -1,11 +1,10 @@
 //! Command-line interface for read transfer and validation.
 
-use std::fs::File;
-use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::{fs::File, net::SocketAddr, path::PathBuf};
 
-use axylph::{Client, Error, Limits, Receiver};
+use axylph::{Client, Limits, Receiver};
 use clap::{Parser, Subcommand};
+use color_eyre::eyre::WrapErr;
 use tokio::net::TcpListener;
 
 #[derive(Parser)]
@@ -43,12 +42,15 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Error> {
+async fn main() -> color_eyre::Result<()> {
+    color_eyre::install()?;
     let cli = Cli::parse();
     let limits = Limits::new(cli.batch_bytes, cli.batch_reads)?;
     match cli.command {
         Command::Serve { listen } => {
-            let listener = TcpListener::bind(listen).await?;
+            let listener = TcpListener::bind(listen)
+                .await
+                .wrap_err_with(|| format!("could not listen on {listen}"))?;
             eprintln!(
                 "Receiving reads at http://{}; no profiling or storage",
                 listener.local_addr()?
@@ -62,8 +64,10 @@ async fn main() -> Result<(), Error> {
                 .await?;
         }
         Command::Send { path, server } => {
+            let input =
+                File::open(&path).wrap_err_with(|| format!("could not open {}", path.display()))?;
             Client::new(server, limits)
-                .send(File::open(path)?, |progress| {
+                .send(input, |progress| {
                     eprintln!(
                         "validated: {} reads, {} bases{}",
                         progress.reads,
@@ -75,7 +79,8 @@ async fn main() -> Result<(), Error> {
                         }
                     );
                 })
-                .await?;
+                .await
+                .wrap_err_with(|| format!("could not transfer {}", path.display()))?;
         }
     }
     Ok(())

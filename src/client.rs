@@ -1,22 +1,30 @@
-use std::io::{Cursor, Read};
-use std::sync::Arc;
+use std::{
+    io::{Cursor, Read},
+    sync::Arc,
+};
 
-use arrow_array::RecordBatch;
-use arrow_array::builder::{ArrayBuilder, BinaryBuilder};
-use arrow_flight::FlightClient;
-use arrow_flight::encode::FlightDataEncoderBuilder;
-use arrow_flight::error::FlightError;
-use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_array::{
+    RecordBatch,
+    builder::{ArrayBuilder, BinaryBuilder},
+};
+use arrow_flight::{
+    FlightClient, encode::FlightDataEncoderBuilder, error::FlightError,
+    flight_service_client::FlightServiceClient,
+};
 use flate2::read::MultiGzDecoder;
 use futures_util::StreamExt;
-use seq_io::fastq::{Reader, Record};
-use seq_io::policy::DoubleUntilLimited;
-use tokio::sync::mpsc;
+use seq_io::{
+    fastq::{Reader, Record},
+    policy::DoubleUntilLimited,
+};
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Endpoint;
 
-use crate::protocol::{MESSAGE_BYTES, schema};
-use crate::{Error, Limits, Progress};
+use crate::{
+    Error, Limits, Progress,
+    protocol::{MESSAGE_BYTES, schema},
+};
 
 /// Sends FASTQ reads as Arrow batches and reports receiver validation counts.
 pub struct Client {
@@ -54,29 +62,39 @@ impl Client {
             .max_encoding_message_size(MESSAGE_BYTES);
         let mut client = FlightClient::new_from_inner(inner);
         let (sender, receiver) = mpsc::channel(1);
+        let (error_sender, mut local_error) = oneshot::channel();
         let limits = self.limits;
         let parser = tokio::task::spawn_blocking(move || {
-            let result = read_batches(reader, limits, &sender);
-            if let Err(error) = &result {
-                let _ = sender.blocking_send(Err(FlightError::protocol(error.to_string())));
+            match read_batches(reader, limits, &sender) {
+                Ok(progress) => Some(progress),
+                Err(error) => {
+                    let notice = FlightError::protocol(error.to_string());
+                    // Preserve the cause before Flight can report the stream failure.
+                    let _ = error_sender.send(error);
+                    let _ = sender.blocking_send(Err(notice));
+                    None
+                }
             }
-            result
         });
         let encoded = FlightDataEncoderBuilder::new()
             .with_schema(schema())
             .with_max_flight_data_size(MESSAGE_BYTES)
             .build(ReceiverStream::new(receiver));
-        let mut responses = client.do_put(encoded).await?;
+        let mut responses = client
+            .do_put(encoded)
+            .await
+            .map_err(|error| transfer_error(error, &mut local_error))?;
         let mut last = Progress::default();
         while let Some(response) = responses.next().await {
-            let progress: Progress = serde_json::from_slice(&response?.app_metadata)?;
+            let response = response.map_err(|error| transfer_error(error, &mut local_error))?;
+            let progress: Progress = serde_json::from_slice(&response.app_metadata)?;
             if last.complete
                 || progress.reads < last.reads
                 || progress.bases < last.bases
                 || (progress.complete
                     && (progress.reads != last.reads || progress.bases != last.bases))
             {
-                return Err("receiver returned inconsistent progress".into());
+                return Err(Error::InconsistentProgress);
             }
             last = progress;
             if !progress.complete {
@@ -84,15 +102,29 @@ impl Client {
             }
         }
         drop(responses);
-        let expected = parser.await??;
+        let Some(expected) = parser.await? else {
+            return Err(local_error.await.map_err(|_| Error::UploadClosed)?);
+        };
         if !last.complete {
-            return Err("upload ended without a completion receipt".into());
+            return Err(Error::MissingCompletion);
         }
         if last != expected {
-            return Err("receiver counts do not match the input".into());
+            return Err(Error::CountMismatch {
+                expected,
+                received: last,
+            });
         }
         on_progress(last);
         Ok(last)
+    }
+}
+
+fn transfer_error(remote: FlightError, local: &mut oneshot::Receiver<Error>) -> Error {
+    // A remote failure must not wait for a reader blocked inside Read::read.
+    // UploadClosed can be a consequence of that failure, rather than its cause.
+    match local.try_recv() {
+        Ok(error) if !matches!(error, Error::UploadClosed) => error,
+        _ => Error::Flight(remote),
     }
 }
 
@@ -115,7 +147,7 @@ fn read_batches<R: Read>(
         .batch_bytes
         .checked_add(4096)
         .and_then(usize::checked_next_power_of_two)
-        .ok_or("parser capacity overflow")?;
+        .ok_or(Error::Overflow("parser capacity"))?;
     let mut parser = Reader::with_capacity(input, capacity.min(8192))
         .set_policy(DoubleUntilLimited::new(capacity, capacity));
     let mut batch = BatchBuilder::new(limits);
@@ -123,19 +155,27 @@ fn read_batches<R: Read>(
     let mut parsed_bases = 0u64;
     while let Some(record) = parser.next() {
         if sender.is_closed() {
-            return Err("receiver closed the upload".into());
+            return Err(Error::UploadClosed);
         }
         let record = record?;
-        parsed_reads = parsed_reads.checked_add(1).ok_or("read count overflow")?;
+        parsed_reads = parsed_reads
+            .checked_add(1)
+            .ok_or(Error::Overflow("read count"))?;
         parsed_bases = parsed_bases
-            .checked_add(u64::try_from(record.seq().len())?)
-            .ok_or("base count overflow")?;
+            .checked_add(
+                u64::try_from(record.seq().len()).map_err(|_| Error::Overflow("base count"))?,
+            )
+            .ok_or(Error::Overflow("base count"))?;
         if let Some(ready) = batch.push(&record)? {
-            sender.blocking_send(Ok(ready))?;
+            sender
+                .blocking_send(Ok(ready))
+                .map_err(|_| Error::UploadClosed)?;
         }
     }
     if !batch.is_empty() {
-        sender.blocking_send(Ok(batch.finish()?))?;
+        sender
+            .blocking_send(Ok(batch.finish()?))
+            .map_err(|_| Error::UploadClosed)?;
     }
     Ok(Progress {
         reads: parsed_reads,
@@ -173,9 +213,12 @@ impl BatchBuilder {
             .len()
             .checked_add(record.seq().len())
             .and_then(|n| n.checked_add(record.qual().len()))
-            .ok_or("read size overflow")?;
+            .ok_or(Error::Overflow("read size"))?;
         if bytes > self.limits.batch_bytes {
-            return Err("one read exceeds the batch byte limit".into());
+            return Err(Error::ReadTooLarge {
+                bytes,
+                limit: self.limits.batch_bytes,
+            });
         }
         let ready = if !self.is_empty()
             && (self.ids.len() >= self.limits.batch_reads
@@ -188,7 +231,10 @@ impl BatchBuilder {
         self.ids.append_value(record.head());
         self.sequences.append_value(record.seq());
         self.qualities.append_value(record.qual());
-        self.bytes = self.bytes.checked_add(bytes).ok_or("batch size overflow")?;
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or(Error::Overflow("batch size"))?;
         Ok(ready)
     }
 

@@ -3,16 +3,15 @@
 //! This prototype does not sketch reads or produce a metagenomic profile.
 
 mod client;
+mod error;
 mod protocol;
 mod receiver;
 
 use serde::{Deserialize, Serialize};
 
 pub use client::Client;
+pub use error::Error;
 pub use receiver::Receiver;
-
-/// An input, connection, or protocol error reported by the client.
-pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// Bounds for one decoded read batch, not the total upload.
 #[derive(Clone, Copy, Debug)]
@@ -29,7 +28,10 @@ impl Limits {
     /// supported maxima: 1 MiB of data and 16,384 reads per batch.
     pub fn new(batch_bytes: usize, batch_reads: usize) -> Result<Self, Error> {
         if !(1..=1_048_576).contains(&batch_bytes) || !(1..=16_384).contains(&batch_reads) {
-            return Err("batch limits must be 1..=1048576 bytes and 1..=16384 reads".into());
+            return Err(Error::InvalidLimits {
+                batch_bytes,
+                batch_reads,
+            });
         }
         Ok(Self {
             batch_bytes,
