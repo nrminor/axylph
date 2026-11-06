@@ -6,6 +6,23 @@ rust-version = "1.99.1"
 publish = false
 description = "Read streaming for a future sylph profiling service"
 
+[dependencies]
+arrow-array = "=60.1.0"
+arrow-flight = { version = "=60.1.0", default-features = false }
+arrow-ipc = { version = "=60.1.0", default-features = false }
+arrow-schema = "=60.1.0"
+async-stream = "=0.3.6"
+axum = { version = "=0.8.9", default-features = false, features = ["http2", "tokio"] }
+clap = { version = "=4.6.7", features = ["derive"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["std", "async-await"] }
+flate2 = "=1.1.11"
+seq_io = "=0.3.4"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "net", "sync", "signal", "time"] }
+tokio-stream = "=0.1.19"
+tonic = { version = "=0.14.9", default-features = false, features = ["transport", "router", "codegen"] }
+
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
