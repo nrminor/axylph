@@ -1,6 +1,7 @@
-//! Transfer sequencing reads to a receiver and report validation progress.
+//! Transfer sequencing reads and accumulate one sample's in-memory sylph sketch.
 //!
-//! This prototype does not sketch reads or produce a metagenomic profile.
+//! Uploads share a receiver's fixed scientific parameters and duplicate history.
+//! This prototype does not produce metagenomic profiles or persist session state.
 
 mod client;
 mod error;
@@ -49,7 +50,11 @@ impl Default for Limits {
     }
 }
 
-/// Cumulative validation counts for one upload, not profiling or durability.
+/// Cumulative validation counts for one upload, not the sample or durable storage.
+///
+/// The receiver emits a batch receipt after adding that batch to its sketch.
+/// Missing receipts do not imply rejection: cancellation can lose a receipt
+/// for accepted data. These counts do not make retries safe.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Progress {

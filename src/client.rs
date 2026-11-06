@@ -43,8 +43,10 @@ impl Client {
     ///
     /// The reader runs on a blocking thread. A stalled reader cannot be forcibly
     /// interrupted; use local files or readers with their own timeouts. Dropping
-    /// this future closes the transfer, and parsing stops at the next channel
-    /// or record check. No automatic retry is attempted.
+    /// this future does not reliably cancel the background request or parser;
+    /// reads may continue reaching the receiver. Parsing stops when the request
+    /// channel closes, at the next channel or record check. No automatic retry
+    /// is attempted.
     ///
     /// # Errors
     /// Returns an error for invalid input, exceeded limits, connection failure,

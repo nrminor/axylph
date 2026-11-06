@@ -1,16 +1,17 @@
-//! Command-line interface for read transfer and validation.
+//! Command-line interface for read transfer and cumulative sketching.
 
 use std::{fs::File, net::SocketAddr, path::PathBuf};
 
 use axylph::{Client, Limits, Receiver};
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::WrapErr;
+use sylph::read_sketch::{Deduplication, ReadSketcher, SketchParams};
 use tokio::net::TcpListener;
 
 #[derive(Parser)]
 #[command(
     version,
-    about = "Transfer sequencing reads. This prototype does not run sylph."
+    about = "Accumulate sequencing read sketches. This prototype does not produce profiles."
 )]
 struct Cli {
     /// Maximum identifier, sequence, and quality bytes per decoded batch.
@@ -25,11 +26,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Receive and validate reads on a trusted network. No authentication or TLS.
+    /// Accumulate one sample on a trusted network. No authentication or TLS.
     Serve {
         /// Address for the Flight service.
         #[arg(long, default_value = "127.0.0.1:50051")]
         listen: SocketAddr,
+        /// Sample shared by every upload to this receiver.
+        #[arg(long)]
+        sample: String,
+        /// Sylph sampling factor (positive).
+        #[arg(long, default_value_t = 200)]
+        c: usize,
+        /// K-mer length (21 or 31).
+        #[arg(long, default_value_t = 31)]
+        k: usize,
+        /// Count every sampled occurrence instead of exact single-end deduplication.
+        #[arg(long)]
+        no_dedup: bool,
     },
     /// Send a plain or gzip FASTQ file and report validation progress.
     Send {
@@ -47,15 +60,35 @@ async fn main() -> color_eyre::Result<()> {
     let cli = Cli::parse();
     let limits = Limits::new(cli.batch_bytes, cli.batch_reads)?;
     match cli.command {
-        Command::Serve { listen } => {
+        Command::Serve {
+            listen,
+            sample,
+            c,
+            k,
+            no_dedup,
+        } => {
+            let sketcher = ReadSketcher::new(
+                SketchParams {
+                    c,
+                    k,
+                    deduplication: if no_dedup {
+                        Deduplication::Disabled
+                    } else {
+                        Deduplication::Exact
+                    },
+                },
+                "axylph".to_owned(),
+                Some(sample.clone()),
+            )?;
             let listener = TcpListener::bind(listen)
                 .await
                 .wrap_err_with(|| format!("could not listen on {listen}"))?;
             eprintln!(
-                "Receiving reads at http://{}; no profiling or storage",
-                listener.local_addr()?
+                "Accumulating sample {sample:?} at http://{} (c={c}, k={k}, dedup={}); no profiling or durable storage",
+                listener.local_addr()?,
+                !no_dedup
             );
-            axum::serve(listener, Receiver::new(limits).router())
+            axum::serve(listener, Receiver::new(limits, sketcher).router())
                 .with_graceful_shutdown(async {
                     if let Err(error) = tokio::signal::ctrl_c().await {
                         eprintln!("Cannot wait for shutdown signal: {error}");

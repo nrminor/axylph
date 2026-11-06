@@ -9,7 +9,7 @@ use tonic::transport;
 
 use crate::Progress;
 
-/// An input, connection, or protocol error reported by the client.
+/// An input, connection, protocol, or receiver-observation error.
 #[derive(Debug, Error)]
 pub enum Error {
     /// Batch limits are zero or exceed the supported maxima.
@@ -71,4 +71,10 @@ pub enum Error {
     /// The blocking parser task panicked or was cancelled.
     #[error(transparent)]
     ParserTask(#[from] JoinError),
+    /// A receiver's blocking task panicked or was cancelled.
+    #[error("receiver task failed: {0}")]
+    ReceiverTask(#[source] JoinError),
+    /// A panic while holding the sketch lock made its state unsafe to reuse.
+    #[error("sketch state is poisoned")]
+    SketchPoisoned,
 }

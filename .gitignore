@@ -26,3 +26,6 @@
 !/src/receiver.rs
 !/tests/
 !/tests/transfer.rs
+!/tests/accumulation.rs
+!/tests/fixtures/
+!/tests/fixtures/read-sketch.json

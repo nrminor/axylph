@@ -13,15 +13,31 @@ use axum::{Router, body::Body, http::Response, routing::post};
 use axylph::{Client, Error, Limits, Progress, Receiver};
 use flate2::{Compression, write::GzEncoder};
 use futures_util::{StreamExt, stream};
+use sylph::read_sketch::{Deduplication, ReadSketcher, SketchError, SketchParams};
 use tokio::net::TcpListener;
 use tonic::{Code, transport::Endpoint};
+
+fn receiver() -> Result<Receiver, SketchError> {
+    Ok(Receiver::new(
+        Limits::default(),
+        ReadSketcher::new(
+            SketchParams {
+                c: 200,
+                k: 31,
+                deduplication: Deduplication::Exact,
+            },
+            "transfer".to_owned(),
+            None,
+        )?,
+    ))
+}
 
 #[tokio::test]
 async fn reports_validated_reads_from_plain_and_gzip_fastq() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        axum::serve(listener, Receiver::new(Limits::default()).router())
+        axum::serve(listener, receiver().unwrap().router())
             .await
             .unwrap();
     });
@@ -65,7 +81,7 @@ async fn rejects_non_nucleotide_data_at_the_flight_endpoint() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        axum::serve(listener, Receiver::new(Limits::default()).router())
+        axum::serve(listener, receiver().unwrap().router())
             .await
             .unwrap();
     });
@@ -108,7 +124,7 @@ async fn accepts_a_read_near_the_batch_byte_limit() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        axum::serve(listener, Receiver::new(Limits::default()).router())
+        axum::serve(listener, receiver().unwrap().router())
             .await
             .unwrap();
     });
@@ -177,7 +193,7 @@ async fn preserves_local_input_errors_through_flight() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        axum::serve(listener, Receiver::new(Limits::default()).router())
+        axum::serve(listener, receiver().unwrap().router())
             .await
             .unwrap();
     });

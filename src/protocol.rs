@@ -26,7 +26,11 @@ pub fn schema() -> SchemaRef {
 }
 
 impl Progress {
-    pub(crate) fn record(&mut self, batch: &RecordBatch, limits: Limits) -> Result<(), Status> {
+    pub(crate) fn record<'a>(
+        &mut self,
+        batch: &'a RecordBatch,
+        limits: Limits,
+    ) -> Result<&'a BinaryArray, Status> {
         if batch.schema() != schema() {
             return Err(Status::invalid_argument(
                 "expected the axylph version 0 read schema",
@@ -102,6 +106,6 @@ impl Progress {
             .ok_or_else(|| Status::resource_exhausted("base count overflow"))?;
         self.reads = reads;
         self.bases = bases;
-        Ok(())
+        Ok(sequences)
     }
 }

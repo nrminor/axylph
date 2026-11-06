@@ -1,0 +1,224 @@
+{
+  "revision": "1f7fcb53aa20b592d8b3b97f75d9971a60eb06e9",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "target": "aarch64-apple-darwin",
+  "extraction_backend": "scalar",
+  "source_fixture": {
+    "path": "tests/fixtures/read-sketch.yaml",
+    "sha256": "7512aab4ec9e7059f4090ae90a7addab2b9aec08e4a9ccf6e2ceb39639c52f2e",
+    "repository": "https://github.com/nrminor/sylph",
+    "revision": "ada9be3d391e7f4ed0b8f5826a65b4f0490839b8",
+    "oracle_repository": "https://github.com/bluenote-1577/sylph",
+    "conversion": "Selected complete cases copied without recomputing expectations; original top-level provenance retained."
+  },
+  "cases": [
+    {
+      "name": "short_and_signature_boundary_65_66_dedup",
+      "c": 8,
+      "k": 21,
+      "no_dedup": false,
+      "reads": [
+        "GTAAGCTGCTTTCCTATTTA",
+        "CTATGTCAAGCGGAACTATCTGGCGCTCAATCTTGCTAATCAAAAAAAAAAAAAAAAAAAAAAAA",
+        "CTATGTCAAGCGGAACTATCTGGCGCTCAATCTTGCTAATCAAAAAAAAAAAAAAAAAAAAAAAA",
+        "CGACCCGGGACATTTGGGCAGGCCAAGCCGGGAGATGTCGAGAAAAAAAAAAAAAAAAAAAAAAAA",
+        "CGACCCGGGACATTTGGGCAGGCCAAGCCGGGAGATGTCGAGAAAAAAAAAAAAAAAAAAAAAAAA"
+      ],
+      "prefixes": [
+        {
+          "kmer_counts": {},
+          "c": 8,
+          "k": 21,
+          "file_name": "reads.fastq",
+          "sample_name": "fixture",
+          "paired": false,
+          "mean_read_length_bits": 4626322717216342016
+        },
+        {
+          "kmer_counts": {
+            "434418420238360296": 1,
+            "441238512809324788": 1,
+            "769200453594203938": 1,
+            "1039929875140557751": 1,
+            "1055631960047346880": 1,
+            "1328713419902119910": 1,
+            "1900673613398749623": 1
+          },
+          "c": 8,
+          "k": 21,
+          "file_name": "reads.fastq",
+          "sample_name": "fixture",
+          "paired": false,
+          "mean_read_length_bits": 4631178160564600832
+        },
+        {
+          "kmer_counts": {
+            "434418420238360296": 2,
+            "441238512809324788": 2,
+            "769200453594203938": 2,
+            "1039929875140557751": 2,
+            "1055631960047346880": 2,
+            "1328713419902119910": 2,
+            "1900673613398749623": 2
+          },
+          "c": 8,
+          "k": 21,
+          "file_name": "reads.fastq",
+          "sample_name": "fixture",
+          "paired": false,
+          "mean_read_length_bits": 4632233691727265792
+        },
+        {
+          "kmer_counts": {
+            "224137574138059486": 1,
+            "434418420238360296": 2,
+            "441238512809324788": 2,
+            "769200453594203938": 2,
+            "1039929875140557751": 2,
+            "1055631960047346880": 2,
+            "1067062432244259297": 1,
+            "1132512785441557540": 1,
+            "1328713419902119910": 2,
+            "1433288483820962568": 1,
+            "1662761188238978138": 1,
+            "1900673613398749623": 2,
+            "2176527920982294724": 1
+          },
+          "c": 8,
+          "k": 21,
+          "file_name": "reads.fastq",
+          "sample_name": "fixture",
+          "paired": false,
+          "mean_read_length_bits": 4632796641680687104
+        },
+        {
+          "kmer_counts": {
+            "224137574138059486": 1,
+            "434418420238360296": 2,
+            "441238512809324788": 2,
+            "769200453594203938": 2,
+            "1039929875140557751": 2,
+            "1055631960047346880": 2,
+            "1067062432244259297": 1,
+            "1132512785441557540": 1,
+            "1328713419902119910": 2,
+            "1433288483820962568": 1,
+            "1662761188238978138": 1,
+            "1900673613398749623": 2,
+            "2176527920982294724": 1
+          },
+          "c": 8,
+          "k": 21,
+          "file_name": "reads.fastq",
+          "sample_name": "fixture",
+          "paired": false,
+          "mean_read_length_bits": 4633134411652739891
+        }
+      ]
+    },
+    {
+      "name": "short_and_signature_boundary_65_66_no_dedup",
+      "c": 8,
+      "k": 21,
+      "no_dedup": true,
+      "reads": [
+        "GTAAGCTGCTTTCCTATTTA",
+        "CTATGTCAAGCGGAACTATCTGGCGCTCAATCTTGCTAATCAAAAAAAAAAAAAAAAAAAAAAAA",
+        "CTATGTCAAGCGGAACTATCTGGCGCTCAATCTTGCTAATCAAAAAAAAAAAAAAAAAAAAAAAA",
+        "CGACCCGGGACATTTGGGCAGGCCAAGCCGGGAGATGTCGAGAAAAAAAAAAAAAAAAAAAAAAAA",
+        "CGACCCGGGACATTTGGGCAGGCCAAGCCGGGAGATGTCGAGAAAAAAAAAAAAAAAAAAAAAAAA"
+      ],
+      "prefixes": [
+        {
+          "kmer_counts": {},
+          "c": 8,
+          "k": 21,
+          "file_name": "reads.fastq",
+          "sample_name": "fixture",
+          "paired": false,
+          "mean_read_length_bits": 4626322717216342016
+        },
+        {
+          "kmer_counts": {
+            "434418420238360296": 1,
+            "441238512809324788": 1,
+            "769200453594203938": 1,
+            "1039929875140557751": 1,
+            "1055631960047346880": 1,
+            "1328713419902119910": 1,
+            "1900673613398749623": 1
+          },
+          "c": 8,
+          "k": 21,
+          "file_name": "reads.fastq",
+          "sample_name": "fixture",
+          "paired": false,
+          "mean_read_length_bits": 4631178160564600832
+        },
+        {
+          "kmer_counts": {
+            "434418420238360296": 2,
+            "441238512809324788": 2,
+            "769200453594203938": 2,
+            "1039929875140557751": 2,
+            "1055631960047346880": 2,
+            "1328713419902119910": 2,
+            "1900673613398749623": 2
+          },
+          "c": 8,
+          "k": 21,
+          "file_name": "reads.fastq",
+          "sample_name": "fixture",
+          "paired": false,
+          "mean_read_length_bits": 4632233691727265792
+        },
+        {
+          "kmer_counts": {
+            "224137574138059486": 1,
+            "434418420238360296": 2,
+            "441238512809324788": 2,
+            "769200453594203938": 2,
+            "1039929875140557751": 2,
+            "1055631960047346880": 2,
+            "1067062432244259297": 1,
+            "1132512785441557540": 1,
+            "1328713419902119910": 2,
+            "1433288483820962568": 1,
+            "1662761188238978138": 1,
+            "1900673613398749623": 2,
+            "2176527920982294724": 1
+          },
+          "c": 8,
+          "k": 21,
+          "file_name": "reads.fastq",
+          "sample_name": "fixture",
+          "paired": false,
+          "mean_read_length_bits": 4632796641680687104
+        },
+        {
+          "kmer_counts": {
+            "224137574138059486": 2,
+            "434418420238360296": 2,
+            "441238512809324788": 2,
+            "769200453594203938": 2,
+            "1039929875140557751": 2,
+            "1055631960047346880": 2,
+            "1067062432244259297": 2,
+            "1132512785441557540": 2,
+            "1328713419902119910": 2,
+            "1433288483820962568": 2,
+            "1662761188238978138": 2,
+            "1900673613398749623": 2,
+            "2176527920982294724": 2
+          },
+          "c": 8,
+          "k": 21,
+          "file_name": "reads.fastq",
+          "sample_name": "fixture",
+          "paired": false,
+          "mean_read_length_bits": 4633134411652739891
+        }
+      ]
+    }
+  ]
+}
