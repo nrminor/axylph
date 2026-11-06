@@ -1,4 +1,27 @@
-/target/
-/.scratch/
-/.agents/
-.DS_Store
+*
+
+# Repository files
+!/.gitignore
+!/Cargo.toml
+!/Cargo.lock
+!/README.md
+!/bacon.toml
+!/clippy.toml
+!/mise.toml
+!/mise.lock
+!/rust-toolchain.toml
+
+# CI
+!/.github/
+!/.github/workflows/
+!/.github/workflows/ci.yml
+
+# Source and tests
+!/src/
+!/src/client.rs
+!/src/lib.rs
+!/src/main.rs
+!/src/protocol.rs
+!/src/receiver.rs
+!/tests/
+!/tests/transfer.rs
