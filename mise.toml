@@ -1,0 +1,77 @@
+min_version = "2026.10.22"
+
+[settings]
+idiomatic_version_file_enable_tools = ["rust"]
+
+[tools]
+rust = { version = "1.99.1", profile = "minimal", components = ["clippy", "rustfmt", "rust-analyzer", "rust-src"], mr_boxington = true }
+mr-boxington = "1.29.1"
+"cargo:bacon" = "3.24.0"
+"aqua:nextest-rs/nextest/cargo-nextest" = "0.9.143"
+"github:bahdotsh/wrkflw" = "0.8.0"
+
+[env]
+MBX_SCHEDULER_TESTS = "1"
+RUSTDOCFLAGS = "-D warnings"
+
+[bootstrap.repos]
+".agents/repos/sylph" = { url = "https://github.com/bluenote-1577/sylph.git" }
+
+[tasks.check]
+description = "Check formatting, lints, tests, and documentation"
+run = [{ task = "fmt-check" }, { task = "lint" }, { task = "test" }, { task = "test-doc" }, { task = "doc-check" }]
+
+[tasks.fmt-check]
+run = "cargo fmt --all -- --check"
+
+[tasks.fmt]
+run = "cargo fmt --all"
+
+[tasks.lint]
+run = "cargo clippy --locked --all-targets --all-features -- -D warnings"
+
+[tasks.test]
+run = "cargo nextest run --locked --all-features --no-tests=pass"
+
+[tasks.test-all]
+run = "cargo nextest run --locked --all-features --no-tests=pass --run-ignored all"
+
+[tasks.test-doc]
+description = "Test library examples when the package has a library"
+run = "if [ -f src/lib.rs ]; then cargo test --doc --locked --all-features; else echo 'No library target: no doctests to run.'; fi"
+
+[tasks.doc-check]
+run = "cargo doc --locked --all-features --no-deps"
+
+[tasks.check-compile]
+run = "cargo check --locked --all-targets --all-features"
+
+[tasks.build]
+alias = "b"
+run = "cargo build --locked"
+
+[tasks.build-release]
+run = "cargo build --locked --release"
+
+[tasks.ci-validate]
+run = "wrkflw validate .github/workflows/ci.yml"
+
+[tasks."bacon:check"]
+alias = "bc"
+interactive = true
+run = "bacon check"
+
+[tasks."bacon:build"]
+alias = "bb"
+interactive = true
+run = "bacon build"
+
+[tasks."bacon:nextest"]
+alias = "bn"
+interactive = true
+run = "bacon nextest"
+
+[tasks."mbx:tui"]
+alias = "mt"
+interactive = true
+run = "mbx tui"
