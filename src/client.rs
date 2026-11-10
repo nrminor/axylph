@@ -1,5 +1,5 @@
 use std::{
-    io::{Cursor, Read},
+    io::{self, Cursor, Read},
     sync::Arc,
 };
 
@@ -17,7 +17,10 @@ use seq_io::{
     fastq::{Reader, Record},
     policy::DoubleUntilLimited,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    runtime::Handle,
+    sync::{mpsc, oneshot, watch},
+};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Endpoint;
 
@@ -41,12 +44,16 @@ impl Client {
 
     /// Read plain or gzip FASTQ and report progress without terminal output.
     ///
-    /// The reader runs on a blocking thread. A stalled reader cannot be forcibly
-    /// interrupted; use local files or readers with their own timeouts. Dropping
-    /// this future does not reliably cancel the background request or parser;
-    /// reads may continue reaching the receiver. Parsing stops when the request
-    /// channel closes, at the next channel or record check. No automatic retry
-    /// is attempted.
+    /// The reader runs on a blocking thread. Dropping this future signals
+    /// cancellation to the request producer and parser, including a parser
+    /// waiting for batch-channel capacity. An executing `Read::read` cannot be
+    /// interrupted; use local files or readers with their own timeouts. Once
+    /// cancellation is observed after that read returns, its bytes are discarded
+    /// and no subsequent source read is started.
+    ///
+    /// Data already handed to the transport may still reach the receiver, and
+    /// accepted reads are not rolled back. The peer may observe request EOF
+    /// rather than a cancellation status. No automatic retry is attempted.
     ///
     /// # Errors
     /// Returns an error for invalid input, exceeded limits, connection failure,
@@ -65,15 +72,18 @@ impl Client {
         let mut client = FlightClient::new_from_inner(inner);
         let (sender, receiver) = mpsc::channel(1);
         let (error_sender, mut local_error) = oneshot::channel();
+        // No values are sent: dropping the sole sender cancels both producers.
+        let (_cancel_on_drop, mut cancelled) = watch::channel(());
+        let mut request_cancelled = cancelled.clone();
         let limits = self.limits;
         let parser = tokio::task::spawn_blocking(move || {
-            match read_batches(reader, limits, &sender) {
+            match read_batches(reader, limits, &sender, &mut cancelled) {
                 Ok(progress) => Some(progress),
                 Err(error) => {
                     let notice = FlightError::protocol(error.to_string());
                     // Preserve the cause before Flight can report the stream failure.
                     let _ = error_sender.send(error);
-                    let _ = sender.blocking_send(Err(notice));
+                    let _ = send_batch(&sender, &mut cancelled, Err(notice));
                     None
                 }
             }
@@ -81,7 +91,10 @@ impl Client {
         let encoded = FlightDataEncoderBuilder::new()
             .with_schema(schema())
             .with_max_flight_data_size(MESSAGE_BYTES)
-            .build(ReceiverStream::new(receiver));
+            .build(ReceiverStream::new(receiver))
+            .take_until(async move {
+                let _ = request_cancelled.changed().await;
+            });
         let mut responses = client
             .do_put(encoded)
             .await
@@ -134,8 +147,12 @@ fn read_batches<R: Read>(
     reader: R,
     limits: Limits,
     sender: &mpsc::Sender<Result<RecordBatch, FlightError>>,
+    cancelled: &mut watch::Receiver<()>,
 ) -> Result<Progress, Error> {
-    let mut reader = reader;
+    let mut reader = CancellableReader {
+        reader,
+        cancelled: cancelled.clone(),
+    };
     let mut prefix = Vec::with_capacity(2);
     reader.by_ref().take(2).read_to_end(&mut prefix)?;
     let gzip = prefix.starts_with(&[0x1f, 0x8b]);
@@ -155,10 +172,17 @@ fn read_batches<R: Read>(
     let mut batch = BatchBuilder::new(limits);
     let mut parsed_reads = 0u64;
     let mut parsed_bases = 0u64;
-    while let Some(record) = parser.next() {
-        if sender.is_closed() {
+    loop {
+        if cancelled.is_closed() || sender.is_closed() {
             return Err(Error::UploadClosed);
         }
+        let record = parser.next();
+        if cancelled.is_closed() || sender.is_closed() {
+            return Err(Error::UploadClosed);
+        }
+        let Some(record) = record else {
+            break;
+        };
         let record = record?;
         parsed_reads = parsed_reads
             .checked_add(1)
@@ -169,21 +193,49 @@ fn read_batches<R: Read>(
             )
             .ok_or(Error::Overflow("base count"))?;
         if let Some(ready) = batch.push(&record)? {
-            sender
-                .blocking_send(Ok(ready))
-                .map_err(|_| Error::UploadClosed)?;
+            send_batch(sender, cancelled, Ok(ready))?;
         }
     }
     if !batch.is_empty() {
-        sender
-            .blocking_send(Ok(batch.finish()?))
-            .map_err(|_| Error::UploadClosed)?;
+        send_batch(sender, cancelled, Ok(batch.finish()?))?;
     }
     Ok(Progress {
         reads: parsed_reads,
         bases: parsed_bases,
         complete: true,
     })
+}
+
+fn send_batch(
+    sender: &mpsc::Sender<Result<RecordBatch, FlightError>>,
+    cancelled: &mut watch::Receiver<()>,
+    batch: Result<RecordBatch, FlightError>,
+) -> Result<(), Error> {
+    Handle::current().block_on(async {
+        tokio::select! {
+            biased;
+            _ = cancelled.changed() => Err(Error::UploadClosed),
+            result = sender.send(batch) => result.map_err(|_| Error::UploadClosed),
+        }
+    })
+}
+
+struct CancellableReader<R> {
+    reader: R,
+    cancelled: watch::Receiver<()>,
+}
+
+impl<R: Read> Read for CancellableReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.cancelled.is_closed() {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        let result = self.reader.read(buffer);
+        if self.cancelled.is_closed() {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        result
+    }
 }
 
 struct BatchBuilder {
