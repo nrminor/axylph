@@ -67,7 +67,7 @@ Clones share the accumulator and upload gate. `inspect` borrows a consistent pro
 
 ## Development
 
-Use Mise 2026.10.22 or newer. Rust is pinned in `mise.toml` and `rust-toolchain.toml`; keep these versions and the Cargo Rust requirement in sync. Sylph's native compression dependencies also require a C/C++ build toolchain and CMake available on PATH; those system tools are not currently pinned by Mise.
+Use Mise 2026.10.22 or newer. Rust is pinned in `mise.toml` and `rust-toolchain.toml`; keep these versions and the Cargo Rust requirement in sync. Axylph selects sylph's scientific core without its CLI, file-I/O, or profiling features, so sylph does not add native compression libraries or a CMake requirement to this build.
 
 ```sh
 mise trust
@@ -82,7 +82,7 @@ mise run ci-validate
 
 The library returns `axylph::Error`, defined with `thiserror` in `src/error.rs`. Application failures have named variants; dependency failures wrap their source errors. The CLI installs `color-eyre` for reporting and adds file or address context. Library callers do not need to install a reporting handler.
 
-Dependencies serve specific roles: Arrow and Flight handle structured reads and IPC, Tonic and Axum serve HTTP/2, and Tokio plus stream adapters provide bounded asynchronous transfer. `seq_io` bounds FASTQ parsing; `flate2` handles gzip, including concatenated members. Serde and JSON encode the progress wire format. Clap handles CLI parsing and help. Sylph owns the scientific algorithm; the current fork also brings its existing CLI, statistics, and native compression dependencies, not a sketch-only dependency graph. Replacing these libraries means taking on their behavior and maintenance, not just removing package names. Optional tracing-span capture in `color-eyre` is disabled because the application does not set up tracing spans.
+Dependencies serve specific roles: Arrow and Flight handle structured reads and IPC, Tonic and Axum serve HTTP/2, and Tokio plus stream adapters provide bounded asynchronous transfer. `seq_io` bounds FASTQ parsing; `flate2` handles gzip, including concatenated members, with its Rust backend. Serde and JSON encode the progress wire format. Clap handles CLI parsing and help. Sylph owns the scientific algorithm and shared sketch types; its default features are disabled so its CLI, file readers, profiling, and native compression dependencies are not compiled. Replacing these libraries means taking on their behavior and maintenance, not just removing package names. Optional tracing-span capture in `color-eyre` is disabled because the application does not set up tracing spans.
 
 Use `mise run bc`, `mise run bb`, or `mise run bn` to watch checks, builds, or tests with Bacon. Mise enables mr-boxington for Rust builds. Use `mise run mt` to inspect its activity. These settings do not by themselves prove cache hits.
 
@@ -92,6 +92,6 @@ Use `mise run bc`, `mise run bb`, or `mise run bn` to watch checks, builds, or t
 mise bootstrap repos apply
 ```
 
-This clones unchanged upstream sylph into `.agents/repos/sylph` for source reference. Production builds instead fetch `https://github.com/nrminor/sylph` at exact revision `ada9be3d391e7f4ed0b8f5826a65b4f0490839b8` through Cargo; they never depend on an ignored local checkout. Planning notes and reference checkouts remain local.
+This clones unchanged upstream sylph into `.agents/repos/sylph` for source reference. Production builds instead fetch `https://github.com/nrminor/sylph` at exact revision `b72776929d93caae9e576f1342078da6d57ab929` through Cargo with `default-features = false`; they never depend on an ignored local checkout. Planning notes and reference checkouts remain local.
 
 The fork preserves upstream CPU dispatch. At this revision AVX2 extraction omits up to three trailing windows that scalar extraction includes. The scientific fixtures avoid sampled omitted windows; passing them is not a general scalar/AVX2 equivalence claim. Axylph has not changed this extraction behavior. Exact deduplication also retains sylph's signature-eligibility and count-four rules; it does not suppress every repeated read forever.
