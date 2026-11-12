@@ -1,6 +1,6 @@
 # axylph
 
-Axylph receives sequencing reads and accumulates a single-end sylph sketch for one sample. **It does not retain reads, produce metagenomic profiles, or save recovery state.**
+Axylph receives sequencing reads and accumulates a single-end sylph sketch for one sample. The library's `Session` periodically publishes cumulative metagenomic profiles; the command-line receiver remains sketch-only. **Neither retains raw reads or saves recovery state.**
 
 The instrument client reads plain or gzip FASTQ and sends Arrow batches through Flight `DoPut`. The receiver runs on Axum and keeps one accumulator across uploads and disconnects. It returns upload-local counts after each batch is validated and sketched. Client logic is separate from terminal output so a future GUI can use the same interface.
 
@@ -53,7 +53,7 @@ Protocol validation checks the whole batch before sketch mutation. A malformed b
 
 A local parser error can look like request EOF to the receiver. The receiver can therefore send a completion receipt even though the source file is invalid. The client checks its parser result and input totals before it reports completion; it returns an error in this case. A receiver receipt alone does not prove that the source file was fully read. This transport prototype has no explicit session-finalization message.
 
-This interface can change before 1.0. Direct HTTP FASTQ uploads, paired-end sketching, profile snapshots, durable recovery, and a GUI are not implemented. Gzip support here is for client input; native network traffic is Arrow, not a FASTQ file.
+This interface can change before 1.0. Direct HTTP FASTQ uploads, paired-end sketching, HTTP profile snapshots, durable recovery, and a GUI are not implemented. Gzip support here is for client input; native network traffic is Arrow, not a FASTQ file.
 
 ## Observing the sketch
 
@@ -67,9 +67,31 @@ let marker_count = receiver.inspect(|sketch| sketch.kmer_counts.len()).await?;
 
 Clones share the accumulator and upload gate. `inspect` borrows a consistent processed prefix on a blocking thread; it neither copies the marker map nor resets duplicate history. It can run between batches of a live upload. Pending batches need not appear yet. Return only the owned information needed and keep callbacks short: ingestion waits for the callback's lock. Do not re-enter the receiver from a callback. Dropping the observation future does not stop a submitted callback. No sketch retrieval endpoint is exposed over the network.
 
+## Observing cumulative profiles
+
+A session owns the analysis; its receiver delivers reads to it. Supply a loaded `sylph::profile::Profiler` with fixed references, options, and an explicitly sized local worker pool, then start a fresh sample on your Tokio runtime (with its time driver enabled):
+
+```rust
+let session = Session::builder("sample-1", profiler)
+    .c(50)
+    .start()?;
+let app = session.receiver().router();
+let observations = session.observe();
+// Serve app and consume observations on your runtime.
+session.shutdown().await?;
+```
+
+The builder defaults to sylph's `SketchParams::default()` (c=200, k=31, exact deduplication), `Limits::default()`, and one-second refresh eligibility. `.sketch_params(...)` replaces the complete scientific configuration; `.c(...)`, `.k(...)`, and `.deduplication(...)` replace individual fields. Later calls win. `.limits(...)` and `.refresh_interval(...)` override the operational settings. Fully explicit `Session::start(limits, sample_name, sketch_params, profiler, refresh_interval)` uses the same initialization path. Startup rejects incompatible sketch/reference parameters before admitting reads; default c=200 therefore needs overriding for c=50/100 references. It never silently changes scientific settings.
+
+`observe()` returns an owned stream: current state first, then coalesced changes. Pin it when using `StreamExt::next`. Observations expose current processed read/base totals, lifecycle and failure information, and an optional shared snapshot. A snapshot carries its own checkpoint and read-only sylph `Profile`; current progress can be ahead of its coverage. Duplicates and reads contributing no markers still count. Holding an older observation retains its result unchanged, but slow consumers can skip intermediate states. This is not a retained history or an HTTP endpoint.
+
+One worker captures a copy of cumulative marker counts and metadata with its checkpoint, then profiles outside the ingestion lock using resident references. It does not copy raw reads, reference genomes, or duplicate history, nor pre-copy pending inputs. An ordinary refresh error preserves the previous snapshot and reports the attempted checkpoint; another automatic attempt requires newer evidence. Before the first success, no profile is available. Refresh eligibility is not a calculation deadline, and large-reference memory use, copy pauses, and sustained throughput have not been characterized.
+
+`shutdown()` closes read admission, stops periodic scheduling, drains admitted blocking work, and awaits active profiling without waiting for upload EOF. Repeated or cancelled waits do not restart or cancel that work. Dropping the owner requests stopping but cannot await synchronous work. Shutdown does not finalize the sample or guarantee a profile covering the last read. Explicit `finish()` is not implemented in this slice. Library consumers own their runtime and choose the profiler's worker count; neither count is a whole-process CPU quota.
+
 ## Development
 
-Use Mise 2026.10.22 or newer. Rust is pinned in `mise.toml` and `rust-toolchain.toml`; keep these versions and the Cargo Rust requirement in sync. Axylph selects sylph's scientific core without its CLI, file-I/O, or profiling features, so sylph does not add native compression libraries or a CMake requirement to this build.
+Use Mise 2026.10.22 or newer. Rust is pinned in `mise.toml` and `rust-toolchain.toml`; keep these versions and the Cargo Rust requirement in sync. Axylph selects sylph's `profile-core` without its CLI or FASTX/file-I/O features, so sylph does not add native compression libraries or a CMake requirement to this build.
 
 ```sh
 mise trust
@@ -78,13 +100,13 @@ mise run check
 mise run ci-validate
 ```
 
-`check` runs formatting, Clippy, nextest, documentation checks, and doctests when `src/lib.rs` exists. Tests exercise the client/server interface and public Flight input handling. Accumulation tests use checked-in expectations generated by unchanged upstream revision `1f7fcb53aa20b592d8b3b97f75d9971a60eb06e9`; they do not run the adapted accumulator to generate their oracle. The JSON fixture records its source, checksums, and generation environment. Build and verification tasks use `Cargo.lock` without updating dependencies.
+`check` runs formatting, Clippy, nextest, documentation checks, and doctests when `src/lib.rs` exists. Tests exercise the client/server interface and public Flight input handling. Accumulation and profile-publication tests use checked-in expectations generated from unchanged upstream revision `1f7fcb53aa20b592d8b3b97f75d9971a60eb06e9`; they do not run the adapted code to generate their oracle. The JSON fixtures record provenance, checksums, and generation environment. The publication tracer covers 23 synthetic reads and their cumulative profile at CLI precision, not unrounded equivalence, overlapping computation/ingestion, or large-workload performance. Build and verification tasks use `Cargo.lock` without updating dependencies.
 
 `.gitignore` denies files by default. Add each source, test, or configuration file to its allowlist when it should be tracked. Keep imports from the same root in one `use` statement.
 
-The library returns `axylph::Error`, defined with `thiserror` in `src/error.rs`. Application failures have named variants; dependency failures wrap their source errors. The CLI installs `color-eyre` for reporting and adds file or address context. Library callers do not need to install a reporting handler.
+Library errors use `axylph::Error`, defined with `thiserror` in `src/error.rs`; session shutdown shares its outcome through `Arc<Error>` so repeated callers observe the same failure. Application failures have named variants; dependency failures wrap their source errors. The CLI installs `color-eyre` for reporting and adds file or address context. Library callers do not need to install a reporting handler.
 
-Dependencies serve specific roles: Arrow and Flight handle structured reads and IPC, Tonic and Axum serve HTTP/2, and Tokio plus stream adapters provide bounded asynchronous transfer. `seq_io` bounds FASTQ parsing; `flate2` handles gzip, including concatenated members, with its Rust backend. Serde and JSON encode the progress wire format. Clap handles CLI parsing and help. Sylph owns the scientific algorithm and shared sketch types; its default features are disabled so its CLI, file readers, profiling, and native compression dependencies are not compiled. Replacing these libraries means taking on their behavior and maintenance, not just removing package names. Optional tracing-span capture in `color-eyre` is disabled because the application does not set up tracing spans.
+Dependencies serve specific roles: Arrow and Flight handle structured reads and IPC, Tonic and Axum serve HTTP/2, and Tokio plus stream adapters provide bounded asynchronous transfer. `seq_io` bounds FASTQ parsing; `flate2` handles gzip, including concatenated members, with its Rust backend. Serde and JSON encode the progress wire format. Clap handles CLI parsing and help. Sylph owns the scientific algorithm, sketch types, and public profile representation; only its embeddable profiling capability is enabled, not CLI, file readers, or native compression. Replacing these libraries means taking on their behavior and maintenance, not just removing package names. Optional tracing-span capture in `color-eyre` is disabled because the application does not set up tracing spans.
 
 Use `mise run bc`, `mise run bb`, or `mise run bn` to watch checks, builds, or tests with Bacon. Mise enables mr-boxington for Rust builds. Use `mise run mt` to inspect its activity. These settings do not by themselves prove cache hits.
 
@@ -94,6 +116,6 @@ Use `mise run bc`, `mise run bb`, or `mise run bn` to watch checks, builds, or t
 mise bootstrap repos apply
 ```
 
-This clones unchanged upstream sylph into `.agents/repos/sylph` for source reference. Production builds instead fetch `https://github.com/nrminor/sylph` at exact revision `b72776929d93caae9e576f1342078da6d57ab929` through Cargo with `default-features = false`; they never depend on an ignored local checkout. Planning notes and reference checkouts remain local.
+This clones unchanged upstream sylph into `.agents/repos/sylph` for source reference. The manifest still pins `https://github.com/nrminor/sylph` at exact revision `b72776929d93caae9e576f1342078da6d57ab929` with default features disabled. The live-profile integration currently requires an unpublished fork revision, supplied by a temporary local Cargo patch and its local lockfile resolution. It is not yet a self-contained published dependency update. Publication and replacement of the exact pin remain separate review steps; the local patch must not be shipped as the dependency selection. Planning notes and reference checkouts remain local.
 
 The fork preserves upstream CPU dispatch. At this revision AVX2 extraction omits up to three trailing windows that scalar extraction includes. The scientific fixtures avoid sampled omitted windows; passing them is not a general scalar/AVX2 equivalence claim. Axylph has not changed this extraction behavior. Exact deduplication also retains sylph's signature-eligibility and count-four rules; it does not suppress every repeated read forever.

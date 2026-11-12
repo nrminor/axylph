@@ -18,10 +18,10 @@ use sylph::{
     read_sketch::{ReadSketcher, SketchError},
     types::SequencesSketch,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore, watch};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::{Error, Limits, Progress, protocol};
+use crate::{Error, Limits, Observation, ProcessedCheckpoint, Progress, SessionState, protocol};
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
@@ -32,13 +32,93 @@ type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'stati
 #[derive(Clone)]
 pub struct Receiver {
     limits: Limits,
+    pub(crate) ingestion: Arc<Ingestion>,
+}
+
+pub struct Ingestion {
     upload: Arc<Semaphore>,
-    state: Arc<Mutex<SketchState>>,
+    state: Mutex<SketchState>,
+    // Held before submission and throughout each blocking ingestion job, even
+    // if the response future is dropped. This lets shutdown drain admitted work.
+    work: Arc<AsyncMutex<()>>,
+    pub(crate) closed: watch::Sender<bool>,
+    pub(crate) observations: watch::Sender<Arc<Observation>>,
 }
 
 struct SketchState {
     sketcher: ReadSketcher,
-    failure: Option<SketchError>,
+    processed: ProcessedCheckpoint,
+    failure: Option<Arc<Error>>,
+}
+
+impl Ingestion {
+    fn check_open(&self) -> Result<(), Status> {
+        if *self.closed.borrow() {
+            return Err(Status::unavailable("session read admission is closed"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn close(&self) {
+        self.closed.send_replace(true);
+        self.observations.send_modify(|observation| {
+            let observation = Arc::make_mut(observation);
+            if observation.state == SessionState::Open {
+                observation.state = SessionState::Stopping;
+            }
+        });
+    }
+
+    pub(crate) async fn drain(&self) {
+        let _idle = self.work.lock().await;
+    }
+
+    pub(crate) fn capture(
+        &self,
+        after: ProcessedCheckpoint,
+    ) -> Result<Option<(SequencesSketch, ProcessedCheckpoint)>, Error> {
+        let state = self.state.lock().map_err(|_| Error::SketchPoisoned)?;
+        if *self.closed.borrow() || state.processed.reads <= after.reads {
+            return Ok(None);
+        }
+        // Clone the actual map, not a rebuilt/sorted collection: scientific
+        // inference may depend on its iteration order. No duplicate history is copied.
+        Ok(Some((state.sketcher.sketch().clone(), state.processed)))
+    }
+
+    fn extend(&self, sequences: &BinaryArray) -> Result<(), Status> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Status::failed_precondition("sketch state is poisoned"))?;
+        let result = state.extend(sequences);
+        self.observations.send_modify(|observation| {
+            let observation = Arc::make_mut(observation);
+            observation.processed = state.processed;
+            observation.ingestion_error.clone_from(&state.failure);
+        });
+        drop(state);
+        result
+    }
+}
+
+impl ProcessedCheckpoint {
+    fn advance<'a>(mut self, sequences: impl Iterator<Item = &'a [u8]>) -> Result<Self, Error> {
+        for sequence in sequences {
+            self.reads = self
+                .reads
+                .checked_add(1)
+                .ok_or(Error::Overflow("processed reads"))?;
+            self.bases = self
+                .bases
+                .checked_add(
+                    u64::try_from(sequence.len())
+                        .map_err(|_| Error::Overflow("processed bases"))?,
+                )
+                .ok_or(Error::Overflow("processed bases"))?;
+        }
+        Ok(self)
+    }
 }
 
 impl SketchState {
@@ -53,8 +133,27 @@ impl SketchState {
 
     fn extend(&mut self, sequences: &BinaryArray) -> Result<(), Status> {
         self.check()?;
+        // Check capacity before mutation so the checkpoint remains exact on failure.
+        let complete = match self.processed.advance(sequences.iter().flatten()) {
+            Ok(complete) => complete,
+            Err(error) => {
+                let status = Status::resource_exhausted(error.to_string());
+                self.failure = Some(Arc::new(error));
+                return Err(status);
+            }
+        };
         // Protocol validation has already rejected every null sequence.
         if let Err(error) = self.sketcher.extend(sequences.iter().flatten()) {
+            let accepted = match &error {
+                SketchError::InvalidRead { read_index }
+                | SketchError::MarkerCountOverflow { read_index }
+                | SketchError::ReadCountLimit { read_index } => *read_index,
+                SketchError::InvalidParameters { .. } => 0,
+            };
+            self.processed = self
+                .processed
+                .advance(sequences.iter().flatten().take(accepted))
+                .map_err(|error| Status::internal(error.to_string()))?;
             let status = match &error {
                 SketchError::MarkerCountOverflow { .. } | SketchError::ReadCountLimit { .. } => {
                     Status::resource_exhausted(error.to_string())
@@ -64,9 +163,10 @@ impl SketchState {
                 }
             };
             // Record this inside the job: its response may already be cancelled.
-            self.failure = Some(error);
+            self.failure = Some(Arc::new(Error::Sketch(error)));
             return Err(status);
         }
+        self.processed = complete;
         Ok(())
     }
 }
@@ -80,11 +180,17 @@ impl Receiver {
     pub fn new(limits: Limits, sketcher: ReadSketcher) -> Self {
         Self {
             limits,
-            upload: Arc::new(Semaphore::new(1)),
-            state: Arc::new(Mutex::new(SketchState {
-                sketcher,
-                failure: None,
-            })),
+            ingestion: Arc::new(Ingestion {
+                upload: Arc::new(Semaphore::new(1)),
+                state: Mutex::new(SketchState {
+                    sketcher,
+                    processed: ProcessedCheckpoint::default(),
+                    failure: None,
+                }),
+                work: Arc::new(AsyncMutex::new(())),
+                closed: watch::channel(false).0,
+                observations: watch::channel(Arc::new(Observation::default())).0,
+            }),
         }
     }
 
@@ -105,9 +211,9 @@ impl Receiver {
         &self,
         observe: impl FnOnce(&SequencesSketch) -> T + Send + 'static,
     ) -> Result<T, Error> {
-        let state = Arc::clone(&self.state);
+        let ingestion = Arc::clone(&self.ingestion);
         tokio::task::spawn_blocking(move || {
-            let state = state.lock().map_err(|_| Error::SketchPoisoned)?;
+            let state = ingestion.state.lock().map_err(|_| Error::SketchPoisoned)?;
             Ok(observe(state.sketcher.sketch()))
         })
         .await
@@ -217,24 +323,30 @@ impl FlightService for Receiver {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
+        self.ingestion.check_open()?;
         let permit = Arc::new(
-            Arc::clone(&self.upload)
+            Arc::clone(&self.ingestion.upload)
                 .try_acquire_owned()
                 .map_err(|_| Status::resource_exhausted("another upload is active"))?,
         );
-        let state = Arc::clone(&self.state);
+        let ingestion = Arc::clone(&self.ingestion);
         let check_permit = Arc::clone(&permit);
+        let work = Arc::clone(&ingestion.work).lock_owned().await;
+        ingestion.check_open()?;
         // Check even schema-only uploads, without waiting on a lock in Tokio.
         tokio::task::spawn_blocking(move || {
             let _permit = check_permit;
-            state
+            let _work = work;
+            ingestion
+                .state
                 .lock()
                 .map_err(|_| Status::failed_precondition("sketch state is poisoned"))?
                 .check()
         })
         .await
         .map_err(|error| Status::internal(Error::ReceiverTask(error).to_string()))??;
-        let state = Arc::clone(&self.state);
+        let ingestion = Arc::clone(&self.ingestion);
+        let mut stopped = ingestion.closed.subscribe();
         let limits = self.limits;
         let mut input = request.into_inner();
         let validated = async_stream::try_stream! {
@@ -252,21 +364,28 @@ impl FlightService for Receiver {
             let permit = permit;
             let mut batches = FlightRecordBatchStream::new_from_flight_data(validated);
             let mut progress = Progress::default();
-            while let Some(batch) = batches.next().await {
+            loop {
+                ingestion.check_open()?;
+                let batch = tokio::select! {
+                    biased;
+                    _ = stopped.changed() => Err(Status::unavailable("session read admission is closed")),
+                    batch = batches.next() => Ok(batch),
+                }?;
+                let Some(batch) = batch else { break; };
                 let batch = batch.map_err(|error| match error {
                     FlightError::Tonic(status) => *status,
                     other => Status::invalid_argument(other.to_string()),
                 })?;
-                let state = Arc::clone(&state);
+                let ingestion = Arc::clone(&ingestion);
+                let work = Arc::clone(&ingestion.work).lock_owned().await;
+                ingestion.check_open()?;
                 // A queued or running batch keeps the gate if this stream is dropped.
                 let batch_permit = Arc::clone(&permit);
                 progress = tokio::task::spawn_blocking(move || {
                     let _permit = batch_permit;
+                    let _work = work;
                     let sequences = progress.record(&batch, limits)?;
-                    let mut state = state.lock()
-                        .map_err(|_| Status::failed_precondition("sketch state is poisoned"))?;
-                    state.extend(sequences)?;
-                    drop(state);
+                    ingestion.extend(sequences)?;
                     Ok::<_, Status>(progress)
                 }).await.map_err(|error| Status::internal(Error::ReceiverTask(error).to_string()))??;
                 let metadata = serde_json::to_vec(&progress)

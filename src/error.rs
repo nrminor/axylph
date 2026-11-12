@@ -3,13 +3,14 @@ use std::io;
 use arrow_flight::error::FlightError;
 use arrow_schema::ArrowError;
 use seq_io::fastq;
+use sylph::{profile::ProfileError, read_sketch::SketchError};
 use thiserror::Error;
 use tokio::task::JoinError;
 use tonic::transport;
 
 use crate::Progress;
 
-/// An input, connection, protocol, or receiver-observation error.
+/// An input, connection, protocol, or analysis-session error.
 #[derive(Debug, Error)]
 pub enum Error {
     /// Batch limits are zero or exceed the supported maxima.
@@ -77,4 +78,19 @@ pub enum Error {
     /// A panic while holding the sketch lock made its state unsafe to reuse.
     #[error("sketch state is poisoned")]
     SketchPoisoned,
+    /// Refresh eligibility must be positive and fit the monotonic clock.
+    #[error("refresh interval must be positive and representable")]
+    InvalidRefreshInterval,
+    /// Starting a session requires a running Tokio runtime.
+    #[error("session startup requires a Tokio runtime")]
+    MissingRuntime,
+    /// Scientific sketch configuration or accumulation failed.
+    #[error(transparent)]
+    Sketch(#[from] SketchError),
+    /// Scientific configuration, compatibility, or profiling failed.
+    #[error(transparent)]
+    Profile(#[from] ProfileError),
+    /// A session worker panicked or was cancelled.
+    #[error("session task failed: {0}")]
+    SessionTask(#[source] JoinError),
 }

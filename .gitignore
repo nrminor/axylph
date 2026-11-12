@@ -24,9 +24,11 @@
 !/src/main.rs
 !/src/protocol.rs
 !/src/receiver.rs
+!/src/session.rs
 !/tests/
 !/tests/transfer.rs
 !/tests/accumulation.rs
+!/tests/profiling.rs
 !/tests/fixtures/
 !/tests/fixtures/read-sketch.json
 !/tests/fixtures/profile/

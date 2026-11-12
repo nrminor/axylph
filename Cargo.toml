@@ -20,7 +20,7 @@ flate2 = "=1.1.11"
 seq_io = "=0.3.4"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
-sylph = { git = "https://github.com/nrminor/sylph", rev = "b72776929d93caae9e576f1342078da6d57ab929", default-features = false }
+sylph = { git = "https://github.com/nrminor/sylph", rev = "b72776929d93caae9e576f1342078da6d57ab929", default-features = false, features = ["profile-core"] }
 thiserror = "=2.0.21"
 tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "net", "sync", "signal", "time", "io-util"] }
 tokio-stream = { version = "=0.1.19", default-features = false }

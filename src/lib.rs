@@ -1,18 +1,24 @@
-//! Transfer sequencing reads and accumulate one sample's in-memory sylph sketch.
+//! Transfer sequencing reads and observe cumulative in-memory sylph profiles.
 //!
 //! Uploads share a receiver's fixed scientific parameters and duplicate history.
-//! This prototype does not produce metagenomic profiles or persist session state.
+//! [`Session`] adds periodic profiles; [`Receiver`] also supports sketch-only use.
+//! Neither interface retains raw reads or persists session state.
 
 mod client;
 mod error;
 mod protocol;
 mod receiver;
+mod session;
 
 use serde::{Deserialize, Serialize};
 
 pub use client::Client;
 pub use error::Error;
 pub use receiver::Receiver;
+pub use session::{
+    Observation, ProcessedCheckpoint, ProfileSnapshot, RefreshFailure, Session, SessionBuilder,
+    SessionState,
+};
 
 /// Bounds for one decoded read batch, not the total upload.
 #[derive(Clone, Copy, Debug)]
