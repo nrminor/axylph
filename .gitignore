@@ -29,3 +29,6 @@
 !/tests/accumulation.rs
 !/tests/fixtures/
 !/tests/fixtures/read-sketch.json
+!/tests/fixtures/profile/
+!/tests/fixtures/profile/default.json
+!/tests/fixtures/profile/reference.syldb
