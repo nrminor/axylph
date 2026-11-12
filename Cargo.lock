@@ -1578,6 +1578,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "sylph"
 version = "1.0.0"
+source = "git+https://github.com/nrminor/sylph?rev=1c9ec8658c5566a424a97fda2512b2a332dabf2c#1c9ec8658c5566a424a97fda2512b2a332dabf2c"
 dependencies = [
  "bincode",
  "fastrand",
