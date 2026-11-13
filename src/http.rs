@@ -1,4 +1,4 @@
-use std::{fmt::Display, sync::Arc};
+use std::{fmt::Display, sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -10,15 +10,16 @@ use axum::{
     },
     routing::get,
 };
-use futures_util::StreamExt;
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 use sylph::{
     profile::{ProfileMode, ProfileOptions, ProfileRow, SequenceEstimate},
     types::AdjustStatus,
 };
-use tokio::sync::watch;
+use tokio::{sync::watch, time::Instant};
 
-use crate::{Error, Observation, ProcessedCheckpoint, ProfileSnapshot, SessionState, session};
+use crate::{
+    Error, Observation, ProcessedCheckpoint, ProfileSnapshot, RefreshFailure, SessionState,
+};
 
 #[derive(Clone)]
 struct Source {
@@ -41,34 +42,101 @@ pub fn router(
     )
 }
 
-async fn events(State(source): State<Source>) -> impl IntoResponse {
+async fn events(State(mut source): State<Source>) -> impl IntoResponse {
     let stream = async_stream::stream! {
-        let mut updates = Box::pin(session::observations(source.updates));
-        let mut first = true;
-        let mut last_profile = None;
-        while let Some(observation) = updates.next().await {
+        let mut delivered: Option<DeliveredObservation> = None;
+        loop {
+            let observation = Arc::clone(&source.updates.borrow_and_update());
             let checkpoint = observation.snapshot().map(|snapshot| snapshot.checkpoint());
-            let status = Status::new(&source.sample_name, &observation);
-            // Successful checkpoints identify immutable profiles within this session;
-            // finish reuses an exact result. Retain no old rows merely for comparison.
-            let event = if first || checkpoint != last_profile {
-                Event::default().event("snapshot").json_data(Snapshot {
-                    status,
-                    profile: observation.snapshot().map(|profile| ProfileData(profile)),
-                })
-            } else {
-                Event::default().event("status").json_data(status)
-            };
-            first = false;
-            last_profile = checkpoint;
+            let new_profile = delivered.as_ref().is_none_or(|last| last.profile != checkpoint);
+            let urgent = new_profile
+                || delivered.as_ref().is_some_and(|last| last.metadata_changed(&observation));
+            let progress = delivered.as_ref().is_none_or(|last| last.processed != observation.processed());
+            let remaining = delivered.as_ref().map_or(Duration::ZERO, DeliveredObservation::remaining);
+            if urgent || (progress && remaining.is_zero()) {
+                let status = Status::new(&source.sample_name, &observation);
+                let event = if new_profile {
+                    Event::default().event("snapshot").json_data(Snapshot {
+                        status,
+                        profile: observation.snapshot().map(|profile| ProfileData(profile)),
+                    })
+                } else {
+                    Event::default().event("status").json_data(status)
+                };
+                let stopped = observation.state() == SessionState::Stopped;
+                delivered = Some(DeliveredObservation::new(&observation));
+                drop(observation);
+                yield event;
+                if stopped { break; }
+                continue;
+            }
             drop(observation);
-            yield event;
+            // The watch slot is the only pending state. Re-read it at the deadline
+            // or after a change, so urgent updates can bypass routine progress.
+            tokio::select! {
+                changed = source.updates.changed() => if changed.is_err() { break; },
+                () = tokio::time::sleep(remaining), if progress => {}
+            }
         }
     };
     (
         [(header::CACHE_CONTROL, "no-store")],
         Sse::new(stream).keep_alive(KeepAlive::default()),
     )
+}
+
+// Retain metadata, not old scientific rows, across backpressure and progress waits.
+struct DeliveredObservation {
+    processed: ProcessedCheckpoint,
+    profile: Option<ProcessedCheckpoint>,
+    state: SessionState,
+    ingestion_error: Option<Arc<Error>>,
+    refresh_error: Option<Arc<RefreshFailure>>,
+    finish: Option<Result<ProcessedCheckpoint, Arc<Error>>>,
+    sent_at: Instant,
+}
+
+impl DeliveredObservation {
+    fn new(observation: &Observation) -> Self {
+        Self {
+            processed: observation.processed(),
+            profile: observation.snapshot().map(|snapshot| snapshot.checkpoint()),
+            state: observation.state(),
+            ingestion_error: observation.ingestion_error().cloned(),
+            refresh_error: observation.refresh_error().cloned(),
+            finish: observation.finish_outcome().map(|outcome| {
+                outcome
+                    .as_ref()
+                    .map(|snapshot| snapshot.checkpoint())
+                    .map_err(Arc::clone)
+            }),
+            sent_at: Instant::now(),
+        }
+    }
+
+    fn metadata_changed(&self, observation: &Observation) -> bool {
+        self.state != observation.state()
+            || !same_failure(self.ingestion_error.as_ref(), observation.ingestion_error())
+            || !same_failure(self.refresh_error.as_ref(), observation.refresh_error())
+            || match (&self.finish, observation.finish_outcome()) {
+                (None, None) => false,
+                (Some(Ok(previous)), Some(Ok(current))) => *previous != current.checkpoint(),
+                (Some(Err(previous)), Some(Err(current))) => !Arc::ptr_eq(previous, current),
+                _ => true,
+            }
+    }
+
+    fn remaining(&self) -> Duration {
+        Duration::from_millis(250).saturating_sub(self.sent_at.elapsed())
+    }
+}
+
+fn same_failure<T>(previous: Option<&Arc<T>>, current: Option<&Arc<T>>) -> bool {
+    match (previous, current) {
+        (None, None) => true,
+        (Some(previous), Some(current)) => Arc::ptr_eq(previous, current),
+        _ => false,
+    }
 }
 
 // Borrow rows and strings until serialization finishes; only the SSE payload is owned.
@@ -293,4 +361,186 @@ enum Estimate {
     High,
     Percent(f64),
     EstimatedReadCount(f64),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{error::Error, sync::Arc, time::Duration};
+
+    use axum::{body::BodyDataStream, extract::State, response::IntoResponse};
+    use futures_util::{FutureExt, StreamExt};
+    use serde_json::{Value, json};
+    use tokio::{sync::watch, time};
+
+    use super::{Source, events};
+    use crate::{Observation, ProcessedCheckpoint, SessionState};
+
+    fn progress(reads: u64, bases: u64) -> Arc<Observation> {
+        let mut observation = Observation::default();
+        observation.processed = ProcessedCheckpoint { reads, bases };
+        Arc::new(observation)
+    }
+
+    // Parse SSE boundaries independently of Axum's body-frame boundaries.
+    async fn next_event(
+        body: &mut BodyDataStream,
+        buffered: &mut String,
+    ) -> Result<(String, Value), Box<dyn Error>> {
+        for frames_read in 0..=16 {
+            if let Some(end) = buffered.find("\n\n") {
+                let event: String = buffered.drain(..end.saturating_add(2)).collect();
+                let name = event
+                    .lines()
+                    .find_map(|line| line.strip_prefix("event: "))
+                    .ok_or("SSE event has no event name")?;
+                let data = event
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Ok((name.to_owned(), serde_json::from_str(&data)?));
+            }
+            if frames_read == 16 {
+                break;
+            }
+            let bytes = body
+                .next()
+                .await
+                .ok_or("SSE body ended before a complete event")??;
+            buffered.push_str(std::str::from_utf8(&bytes)?);
+        }
+        Err("SSE event exceeded the test's 16-frame bound".into())
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn progress_events_are_coalesced_until_the_next_250ms_deadline() {
+        // A controlled source isolates stream cadence from profiling and networking.
+        let (updates, receiver) = watch::channel(progress(0, 0));
+        let response = events(State(Source {
+            sample_name: Arc::from("cadence"),
+            updates: receiver,
+        }))
+        .await
+        .into_response();
+        let mut body = response.into_body().into_data_stream();
+        let mut buffered = String::new();
+        let started = time::Instant::now();
+        let (name, initial) =
+            time::timeout(Duration::from_secs(1), next_event(&mut body, &mut buffered))
+                .await
+                .expect("initial snapshot must arrive within one virtual second")
+                .expect("initial snapshot must be a complete JSON SSE event");
+        assert_eq!(name, "snapshot");
+        assert_eq!(
+            initial["status"]["processed"],
+            json!({"reads": "0", "bases": "0"})
+        );
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "initial snapshot must be immediate"
+        );
+
+        updates
+            .send(progress(1, 510))
+            .expect("SSE receiver must remain subscribed");
+        time::advance(Duration::from_millis(250)).await;
+        let (name, first) =
+            time::timeout(Duration::from_secs(1), next_event(&mut body, &mut buffered))
+                .await
+                .expect("first status must arrive within one virtual second")
+                .expect("first status must be a complete JSON SSE event");
+        assert_eq!(name, "status");
+        assert_eq!(first["processed"], json!({"reads": "1", "bases": "510"}));
+        assert_eq!(started.elapsed(), Duration::from_millis(250));
+
+        updates
+            .send(progress(2, 1020))
+            .expect("SSE receiver must remain subscribed");
+        let mut next = Box::pin(next_event(&mut body, &mut buffered));
+        assert!(
+            next.as_mut().now_or_never().is_none(),
+            "progress 2 emitted at the previous event's timestamp; throttle routine status events"
+        );
+        updates
+            .send(progress(3, 1530))
+            .expect("SSE receiver must remain subscribed");
+        assert!(
+            next.as_mut().now_or_never().is_none(),
+            "progress 3 must replace pending progress, not bypass the cadence"
+        );
+        time::advance(Duration::from_millis(249)).await;
+        assert!(
+            next.as_mut().now_or_never().is_none(),
+            "routine progress must remain pending until the full 250ms deadline"
+        );
+        time::advance(Duration::from_millis(1)).await;
+        let (name, latest) = time::timeout(Duration::from_secs(1), next)
+            .await
+            .expect("coalesced status must arrive within one virtual second")
+            .expect("coalesced status must be a complete JSON SSE event");
+        assert_eq!(name, "status");
+        assert_eq!(
+            latest["processed"],
+            json!({"reads": "3", "bases": "1530"}),
+            "the cadence deadline must emit the newest progress, never stale progress 2"
+        );
+        assert_eq!(started.elapsed(), Duration::from_millis(500));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn stopping_bypasses_pending_progress_cadence_with_newest_counts() {
+        let (updates, receiver) = watch::channel(progress(0, 0));
+        let response = events(State(Source {
+            sample_name: Arc::from("cadence"),
+            updates: receiver,
+        }))
+        .await
+        .into_response();
+        let mut body = response.into_body().into_data_stream();
+        let mut buffered = String::new();
+        let started = time::Instant::now();
+        let (name, initial) =
+            time::timeout(Duration::from_secs(1), next_event(&mut body, &mut buffered))
+                .await
+                .expect("initial snapshot must arrive within one virtual second")
+                .expect("initial snapshot must be a complete JSON SSE event");
+        assert_eq!(name, "snapshot");
+        assert_eq!(initial["status"]["state"], "open");
+        assert_eq!(started.elapsed(), Duration::ZERO);
+
+        updates
+            .send(progress(1, 510))
+            .expect("SSE receiver must remain subscribed");
+        let mut next = Box::pin(next_event(&mut body, &mut buffered));
+        assert!(
+            next.as_mut().now_or_never().is_none(),
+            "routine progress must remain pending before the cadence deadline"
+        );
+
+        let mut stopping = progress(2, 1020);
+        Arc::make_mut(&mut stopping).state = SessionState::Stopping;
+        updates
+            .send(stopping)
+            .expect("SSE receiver must remain subscribed for the stopping transition");
+        let (name, status) = next
+            .as_mut()
+            .now_or_never()
+            .expect(
+                "stopping must immediately unblock the pending SSE event without advancing time",
+            )
+            .expect("stopping status must be a complete JSON SSE event");
+        assert_eq!(name, "status");
+        assert_eq!(status["state"], "stopping");
+        assert_eq!(
+            status["processed"],
+            json!({"reads": "2", "bases": "1020"}),
+            "stopping must carry newest counts rather than the pending routine progress"
+        );
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "stopping must bypass the routine progress cadence"
+        );
+    }
 }
