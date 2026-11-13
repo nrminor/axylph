@@ -25,11 +25,35 @@ axylph send reads.fastq.gz
 
 The receiver listens at `127.0.0.1:50051` by default. Use `serve --listen HOST:PORT` and `send FILE --server http://HOST:PORT` to select another address. There is no authentication or TLS. Use a trusted local network; do not expose this prototype to the public internet.
 
-Every upload to this receiver belongs to the same sample. `serve` requires `--sample`; `--c` defaults to 200, `--k` to 31, and exact single-end deduplication is enabled unless `--no-dedup` is supplied. Only positive c and k=21/31 are supported. These settings remain fixed until a new receiver is started. The CLI has no sample routing or explicit session-finalization operation yet.
+Every upload to this receiver belongs to the same sample. Without a sample from `--sample`, the environment, or configuration, `serve` generates a name for the run and prints it at startup. `--c` defaults to 200, `--k` to 31, and exact single-end deduplication is enabled by default. Only positive c and k=21/31 are supported. These settings remain fixed until a new receiver is started. The CLI has no sample routing or explicit session-finalization operation yet.
 
 Progress counts start at zero for each upload. A batch receipt follows validation and sketch accumulation; it does not promise a profile or durable storage. A completion report requires a clean input end, successful local parsing, a successful RPC, and matching client/server totals. Completion ends the upload, not the sample. There is no rollback or automatic retry.
 
 On disconnect, accepted reads remain in memory. A submitted batch can finish after cancellation, and its receipt can be lost. **Do not replay an uncertain upload:** biological deduplication is not transport replay suppression. A new upload may briefly receive `RESOURCE_EXHAUSTED` while the previous batch finishes. Restarting the process loses all accumulated state.
+
+## Configuration
+
+Values resolve in order: command-line option, environment variable, TOML file, then built-in default. Select one file with `--config PATH`, otherwise `AXYLPH_CONFIG`, otherwise `axylph.toml` in the current directory. A missing implicit `axylph.toml` is ignored; an explicitly selected missing or unreadable file is an error. Unknown TOML keys are errors.
+
+```toml
+#:schema ./axylph.schema.json
+batch_bytes = 1048576
+batch_reads = 1024
+
+[serve]
+sample = "sample-1"
+listen = "127.0.0.1:50051"
+c = 200
+k = 31
+dedup = true
+
+[send]
+server = "http://127.0.0.1:50051"
+```
+
+The schema path is relative to the TOML file. The corresponding environment variables are `AXYLPH_BATCH_BYTES`, `AXYLPH_BATCH_READS`, `AXYLPH_SAMPLE`, `AXYLPH_LISTEN`, `AXYLPH_C`, `AXYLPH_K`, `AXYLPH_DEDUP`, and `AXYLPH_SERVER`; `AXYLPH_CONFIG` selects the file. Boolean `AXYLPH_DEDUP` accepts `true` or `false`; CLI flags `--dedup` and `--no-dedup` explicitly enable or disable it and conflict with each other.
+
+Bare `axylph` runs `serve`; `axylph send FILE` uses `[send]`. Shared limits and the active command's values are resolved and validated; inactive command settings are not semantically validated, although the whole file must parse with known keys and correct TOML types. Serve-only CLI options cannot be used with `send`. The JSON Schema checks structure and types, not all runtime constraints; runtime validation is authoritative. Regenerate it with `mise run schema` and check it with `mise run schema-check` (also included in `mise run check`). `axylph schema` prints the schema without loading configuration.
 
 ## Input and limits
 
@@ -128,7 +152,7 @@ mise run check
 mise run ci-validate
 ```
 
-`check` runs formatting, Clippy, nextest, documentation checks, and doctests when `src/lib.rs` exists. Tests exercise the client/server interface and public Flight input handling. Accumulation, profile-publication, and finish tests use checked-in expectations generated from unchanged upstream revision `1f7fcb53aa20b592d8b3b97f75d9971a60eb06e9`; they do not run the adapted code to generate their oracle. The JSON fixtures record provenance, checksums, and generation environment. The profiling tracers cover 23 synthetic reads and their cumulative profile at CLI precision, including library finality retained after shutdown and a real HTTP/1.1 SSE subscription alongside HTTP/2 Flight on one listener. The SSE tracer checks initial absence and independently expected profile values; it does not establish reconnect or delivery-rate behavior. These checks do not establish unrounded equivalence, overlapping computation/ingestion, lifecycle-race behavior, or large-workload performance. Build and verification tasks use `Cargo.lock` without updating dependencies.
+`check` runs formatting, Clippy, nextest, documentation and schema checks, and doctests when `src/lib.rs` exists. Tests exercise the client/server interface and public Flight input handling. Accumulation, profile-publication, and finish tests use checked-in expectations generated from unchanged upstream revision `1f7fcb53aa20b592d8b3b97f75d9971a60eb06e9`; they do not run the adapted code to generate their oracle. The JSON fixtures record provenance, checksums, and generation environment. The profiling tracers cover 23 synthetic reads and their cumulative profile at CLI precision, including library finality retained after shutdown and a real HTTP/1.1 SSE subscription alongside HTTP/2 Flight on one listener. The SSE tracer checks initial absence and independently expected profile values; it does not establish reconnect or delivery-rate behavior. These checks do not establish unrounded equivalence, overlapping computation/ingestion, lifecycle-race behavior, or large-workload performance. Build and verification tasks use `Cargo.lock` without updating dependencies.
 
 Controlled-clock internal tests exercise progress coalescing and a lifecycle change bypassing pending progress on the real SSE response body with a controlled observation source. They establish server emission eligibility at the 250 ms boundary, not TCP arrival spacing or scientific scheduling. The end-to-end tracer remains the independent transport/scientific check.
 

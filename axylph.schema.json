@@ -1,0 +1,60 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FileConfig",
+  "type": "object",
+  "properties": {
+    "batch_bytes": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "batch_reads": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "send": {
+      "$ref": "#/definitions/FileSend"
+    },
+    "serve": {
+      "$ref": "#/definitions/FileServe"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "FileSend": {
+      "type": "object",
+      "properties": {
+        "server": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FileServe": {
+      "type": "object",
+      "properties": {
+        "c": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "dedup": {
+          "type": "boolean"
+        },
+        "k": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "listen": {
+          "type": "string"
+        },
+        "sample": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,65 +1,22 @@
 //! Command-line interface for read transfer and cumulative sketching.
 
-use std::{fs::File, net::SocketAddr, path::PathBuf};
+mod config;
 
-use axylph::{Client, Limits, Receiver};
-use clap::{Parser, Subcommand};
+use std::fs::File;
+
+use axylph::{Client, Receiver};
 use color_eyre::eyre::WrapErr;
+use config::Command;
 use sylph::read_sketch::{Deduplication, ReadSketcher, SketchParams};
 use tokio::net::TcpListener;
-
-#[derive(Parser)]
-#[command(
-    version,
-    about = "Accumulate sequencing read sketches. This prototype does not produce profiles."
-)]
-struct Cli {
-    /// Maximum identifier, sequence, and quality bytes per decoded batch.
-    #[arg(long, default_value_t = 1_048_576, global = true)]
-    batch_bytes: usize,
-    /// Maximum reads per batch.
-    #[arg(long, default_value_t = 1024, global = true)]
-    batch_reads: usize,
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Accumulate one sample on a trusted network. No authentication or TLS.
-    Serve {
-        /// Address for the Flight service.
-        #[arg(long, default_value = "127.0.0.1:50051")]
-        listen: SocketAddr,
-        /// Sample shared by every upload to this receiver.
-        #[arg(long)]
-        sample: String,
-        /// Sylph sampling factor (positive).
-        #[arg(long, default_value_t = 200)]
-        c: usize,
-        /// K-mer length (21 or 31).
-        #[arg(long, default_value_t = 31)]
-        k: usize,
-        /// Count every sampled occurrence instead of exact single-end deduplication.
-        #[arg(long)]
-        no_dedup: bool,
-    },
-    /// Send a plain or gzip FASTQ file and report validation progress.
-    Send {
-        /// Path to a four-line-per-read FASTQ file, optionally gzip compressed.
-        path: PathBuf,
-        /// HTTP address of the Flight service.
-        #[arg(long, default_value = "http://127.0.0.1:50051")]
-        server: String,
-    },
-}
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
-    let cli = Cli::parse();
-    let limits = Limits::new(cli.batch_bytes, cli.batch_reads)?;
+    let cli = config::parse()?;
+    let limits = cli.limits;
     match cli.command {
+        Command::Schema => config::print_schema()?,
         Command::Serve {
             listen,
             sample,

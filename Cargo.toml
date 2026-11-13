@@ -20,6 +20,8 @@ flate2 = "=1.1.11"
 seq_io = "=0.3.4"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
+schemars = "=1.2.3"
+toml = { version = "=1.2.1", default-features = false, features = ["std", "serde", "parse"] }
 sylph = { git = "https://github.com/nrminor/sylph", rev = "1c9ec8658c5566a424a97fda2512b2a332dabf2c", default-features = false, features = ["profile-core"] }
 thiserror = "=2.0.21"
 tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "net", "sync", "signal", "time", "io-util"] }
@@ -30,7 +32,7 @@ tonic = { version = "=0.14.9", default-features = false, features = ["transport"
 http-body-util = "=0.1.5"
 hyper = { version = "=1.12.0", default-features = false, features = ["client", "http1"] }
 hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio"] }
-tokio = { version = "=1.54.1", features = ["test-util"] }
+tokio = { version = "=1.54.1", features = ["test-util", "process"] }
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }

@@ -18,8 +18,16 @@ RUSTDOCFLAGS = "-D warnings"
 ".agents/repos/sylph" = { url = "https://github.com/bluenote-1577/sylph.git" }
 
 [tasks.check]
-description = "Check formatting, lints, tests, and documentation"
-run = [{ task = "fmt-check" }, { task = "lint" }, { task = "test" }, { task = "test-doc" }, { task = "doc-check" }]
+description = "Check formatting, lints, tests, documentation, and schema"
+run = [{ task = "fmt-check" }, { task = "lint" }, { task = "test" }, { task = "test-doc" }, { task = "doc-check" }, { task = "schema-check" }]
+
+[tasks.schema]
+description = "Regenerate the configuration schema"
+run = "cargo run --locked -- schema > axylph.schema.json"
+
+[tasks.schema-check]
+description = "Check that the configuration schema is up to date"
+run = "tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; cargo run --locked -- schema > \"$tmp\" && cmp \"$tmp\" axylph.schema.json"
 
 [tasks.fmt-check]
 run = "cargo fmt --all -- --check"
