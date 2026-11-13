@@ -18,7 +18,10 @@ use sylph::{
     read_sketch::{ReadSketcher, SketchError},
     types::SequencesSketch,
 };
-use tokio::sync::{Mutex as AsyncMutex, Semaphore, watch};
+use tokio::{
+    sync::{Mutex as AsyncMutex, Semaphore, watch},
+    time::Instant,
+};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{Error, Limits, Observation, ProcessedCheckpoint, Progress, SessionState, protocol};
@@ -57,6 +60,12 @@ struct SketchState {
     failure: Option<Arc<Error>>,
 }
 
+pub struct ProfileCapture {
+    pub(crate) sketch: SequencesSketch,
+    pub(crate) checkpoint: ProcessedCheckpoint,
+    pub(crate) started_at: Instant,
+}
+
 impl Ingestion {
     fn check_open(&self) -> Result<(), Status> {
         if self.closed.borrow().is_some() {
@@ -90,14 +99,20 @@ impl Ingestion {
     pub(crate) fn capture(
         &self,
         after: ProcessedCheckpoint,
-    ) -> Result<Option<(SequencesSketch, ProcessedCheckpoint)>, Error> {
+    ) -> Result<Option<ProfileCapture>, Error> {
         let state = self.state.lock().map_err(|_| Error::SketchPoisoned)?;
         if self.closed.borrow().is_some() || state.processed.reads <= after.reads {
             return Ok(None);
         }
         // Clone the actual map, not a rebuilt/sorted collection: scientific
         // inference may depend on its iteration order. No duplicate history is copied.
-        Ok(Some((state.sketcher.sketch().clone(), state.processed)))
+        // Anchor cadence here, excluding blocking-pool and sketch-lock waits.
+        let started_at = Instant::now();
+        Ok(Some(ProfileCapture {
+            sketch: state.sketcher.sketch().clone(),
+            checkpoint: state.processed,
+            started_at,
+        }))
     }
 
     pub(crate) fn checkpoint(&self) -> Result<ProcessedCheckpoint, Error> {

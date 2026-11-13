@@ -8,11 +8,7 @@ use sylph::{
     profile::{Profile, ProfileError, Profiler},
     read_sketch::{Deduplication, ReadSketcher, SketchParams},
 };
-use tokio::{
-    runtime::Handle,
-    sync::watch,
-    time::{Instant, MissedTickBehavior},
-};
+use tokio::{runtime::Handle, sync::watch, time::Instant};
 
 use crate::{
     Error, Limits, Receiver,
@@ -161,7 +157,7 @@ pub struct Session {
 }
 
 impl Session {
-    /// Configure a fresh sample with sylph's defaults and one-second refresh eligibility.
+    /// Configure a fresh sample with sylph's defaults and one-second capture-start spacing.
     /// The supplied profiler already owns its references, options, and worker pool.
     pub fn builder(sample_name: impl Into<String>, profiler: Profiler) -> SessionBuilder {
         SessionBuilder {
@@ -372,7 +368,9 @@ impl SessionBuilder {
         self.sketch_params.deduplication = policy;
         self
     }
-    /// Override refresh eligibility (default one second), not a completion deadline.
+    /// Set minimum spacing between periodic input-capture starts (default one second).
+    /// Long calculations can run back-to-back; this is not a completion cooldown
+    /// or deadline. Idle input checks use the same interval. Finish bypasses this wait.
     pub const fn refresh_interval(mut self, interval: Duration) -> Self {
         self.refresh_interval = interval;
         self
@@ -392,14 +390,41 @@ impl SessionBuilder {
     }
 }
 
+struct RefreshCadence {
+    interval: Duration,
+    eligible_at: Instant,
+}
+
+impl RefreshCadence {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            eligible_at: Instant::now(),
+        }
+    }
+
+    async fn wait(&self) {
+        tokio::time::sleep_until(self.eligible_at).await;
+    }
+
+    fn after_attempt(&mut self, started: Option<Instant>) -> Result<(), Error> {
+        // No-input checks still need a future wake-up, not a busy loop. Actual
+        // attempts use capture start on success and failure, never completion.
+        let anchor = started.unwrap_or_else(Instant::now);
+        self.eligible_at = anchor
+            .checked_add(self.interval)
+            .ok_or(Error::InvalidRefreshInterval)?;
+        Ok(())
+    }
+}
+
 async fn refresh(
     ingestion: &Arc<Ingestion>,
     profiler: &Arc<Profiler>,
     interval: Duration,
 ) -> Result<(), Error> {
     let mut closed = ingestion.closed.subscribe();
-    let mut timer = tokio::time::interval(interval);
-    timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut cadence = RefreshCadence::new(interval);
     let mut attempted = ProcessedCheckpoint::default();
     loop {
         if closed.borrow().is_some() {
@@ -408,21 +433,26 @@ async fn refresh(
         tokio::select! {
             biased;
             _ = closed.changed() => break,
-            _ = timer.tick() => {}
+            () = cadence.wait() => {}
         }
         let input = Arc::clone(ingestion);
         let profiler = Arc::clone(profiler);
         let calculated = tokio::task::spawn_blocking(move || {
-            let Some((sketch, checkpoint)) = input.capture(attempted)? else {
+            let Some(capture) = input.capture(attempted)? else {
                 return Ok(None);
             };
-            Ok::<_, Error>(Some((checkpoint, profiler.profile(&sketch))))
+            let checkpoint = capture.checkpoint;
+            let started_at = capture.started_at;
+            let result = profiler.profile(&capture.sketch);
+            Ok::<_, Error>(Some((checkpoint, started_at, result)))
         })
         .await
         .map_err(Error::SessionTask)??;
-        let Some((checkpoint, result)) = calculated else {
+        let Some((checkpoint, started_at, result)) = calculated else {
+            cadence.after_attempt(None)?;
             continue;
         };
+        cadence.after_attempt(Some(started_at))?;
         attempted = checkpoint;
         ingestion.observations.send_modify(|observation| {
             let observation = Arc::make_mut(observation);
@@ -465,4 +495,65 @@ async fn terminal_profile(
     })
     .await
     .map_err(Error::SessionTask)?
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures_util::FutureExt;
+    use tokio::time::{Instant, advance};
+
+    use super::RefreshCadence;
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn periodic_capture_waits_from_actual_start_without_post_work_cooldown() {
+        let origin = Instant::now();
+        let mut cadence = RefreshCadence::new(Duration::from_millis(1000));
+        assert_eq!(cadence.wait().now_or_never(), Some(()));
+        let first_start = Instant::now();
+
+        // Work longer than the interval must not introduce a completion-based cooldown.
+        advance(Duration::from_millis(1500)).await;
+        cadence
+            .after_attempt(Some(first_start))
+            .expect("first deadline must fit the clock; inspect capture time and interval");
+        assert_eq!(cadence.wait().now_or_never(), Some(()));
+        let second_start = Instant::now();
+        assert_eq!(
+            second_start.duration_since(origin),
+            Duration::from_millis(1500)
+        );
+
+        advance(Duration::from_millis(100)).await;
+        cadence
+            .after_attempt(Some(second_start))
+            .expect("second deadline must fit the clock; inspect capture time and interval");
+        {
+            let wait = cadence.wait();
+            tokio::pin!(wait);
+            assert_eq!(wait.as_mut().now_or_never(), None);
+            advance(Duration::from_millis(400)).await;
+            // The old interval grid would incorrectly permit another capture at 2000ms.
+            assert_eq!(wait.as_mut().now_or_never(), None);
+            advance(Duration::from_millis(499)).await;
+            assert_eq!(wait.as_mut().now_or_never(), None);
+            advance(Duration::from_millis(1)).await;
+            // Eligibility is 2500ms, not the completion-based deadline of 2600ms.
+            assert_eq!(wait.as_mut().now_or_never(), Some(()));
+        }
+        assert_eq!(origin.elapsed(), Duration::from_millis(2500));
+
+        cadence
+            .after_attempt(None)
+            .expect("an idle check must schedule another poll rather than busy-spin");
+        let wait = cadence.wait();
+        tokio::pin!(wait);
+        assert_eq!(wait.as_mut().now_or_never(), None);
+        advance(Duration::from_millis(999)).await;
+        assert_eq!(wait.as_mut().now_or_never(), None);
+        advance(Duration::from_millis(1)).await;
+        assert_eq!(wait.as_mut().now_or_never(), Some(()));
+        assert_eq!(origin.elapsed(), Duration::from_millis(3500));
+    }
 }
