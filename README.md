@@ -1,6 +1,6 @@
 # axylph
 
-Axylph receives sequencing reads and accumulates a single-end sylph sketch for one sample. The library's `Session` periodically publishes cumulative metagenomic profiles; the command-line receiver remains sketch-only. **Neither retains raw reads or saves recovery state.**
+Axylph receives sequencing reads and accumulates a single-end sylph sketch for one sample. With a reference, the command-line receiver periodically publishes cumulative metagenomic profiles; without one, it is sketch-only. The library also exposes profiling through `Session`. **Neither mode retains raw reads or saves recovery state.**
 
 The instrument client reads plain or gzip FASTQ and sends Arrow batches through Flight `DoPut`. The receiver runs on Axum and keeps one accumulator across uploads and disconnects. It returns upload-local counts after each batch is validated and sketched. Client logic is separate from terminal output so a future GUI can use the same interface.
 
@@ -25,7 +25,9 @@ axylph send reads.fastq.gz
 
 The receiver listens at `127.0.0.1:50051` by default. Use `serve --listen HOST:PORT` and `send FILE --server http://HOST:PORT` to select another address. There is no authentication or TLS. Use a trusted local network; do not expose this prototype to the public internet.
 
-Every upload to this receiver belongs to the same sample. Without a sample from `--sample`, the environment, or configuration, `serve` generates a name for the run and prints it at startup. `--c` defaults to 200, `--k` to 31, and exact single-end deduplication is enabled by default. Only positive c and k=21/31 are supported. These settings remain fixed until a new receiver is started. The CLI has no sample routing or explicit session-finalization operation yet.
+Every upload to this receiver belongs to the same sample. Without a sample from `--sample`, the environment, or configuration, `serve` generates a name for the run and prints it at startup. `--c` defaults to 200, `--k` to 31, and exact single-end deduplication is enabled by default. Only positive c and k=21/31 are supported. These settings remain fixed until a new receiver is started. There is no sample routing. A profiled receiver supports explicit finalization over HTTP, but a separate `axylph finish` subcommand and a HUD are not implemented.
+
+To enable profiles, supply an existing sylph reference database with `serve --reference PATH` (or the configuration sources below). The reference must be compatible with the selected sketch parameters: startup rejects incompatibility before binding the listener, rather than changing scientific defaults. For example, a c=50 or c=100 reference requires an explicit matching `--c`. Profiled startup reports the resolved reference path and profiling settings with the sample summary. Profiling uses sylph's `ProfileOptions::default()`.
 
 Progress counts start at zero for each upload. A batch receipt follows validation and sketch accumulation; it does not promise a profile or durable storage. A completion report requires a clean input end, successful local parsing, a successful RPC, and matching client/server totals. Completion ends the upload, not the sample. There is no rollback or automatic retry.
 
@@ -51,7 +53,11 @@ dedup = true
 server = "http://127.0.0.1:50051"
 ```
 
-The schema path is relative to the TOML file. The corresponding environment variables are `AXYLPH_BATCH_BYTES`, `AXYLPH_BATCH_READS`, `AXYLPH_SAMPLE`, `AXYLPH_LISTEN`, `AXYLPH_C`, `AXYLPH_K`, `AXYLPH_DEDUP`, and `AXYLPH_SERVER`; `AXYLPH_CONFIG` selects the file. Boolean `AXYLPH_DEDUP` accepts `true` or `false`; CLI flags `--dedup` and `--no-dedup` explicitly enable or disable it and conflict with each other.
+The schema path is relative to the TOML file. Profiling is selected with `--reference`, `AXYLPH_REFERENCE`, or `[serve] reference`. A relative reference path from TOML is relative to the selected configuration file's directory; a relative CLI or environment path is relative to the current working directory. Without a reference, the receiver is sketch-only and explicitly setting profiling tuning options is an error.
+
+`--profile-workers`, `AXYLPH_PROFILE_WORKERS`, or `[serve] profile_workers` sets the positive size of the separate profiling worker pool. `--refresh-interval-ms`, `AXYLPH_REFRESH_INTERVAL_MS`, or `[serve] refresh_interval_ms` sets positive minimum refresh start spacing in milliseconds (default 1000). The default profiling pool has two workers when at least two CPUs are available, otherwise one. The CLI's separate async runtime also uses two or one workers by the same rule; neither pool is a whole-process CPU quota.
+
+The other environment variables are `AXYLPH_BATCH_BYTES`, `AXYLPH_BATCH_READS`, `AXYLPH_SAMPLE`, `AXYLPH_LISTEN`, `AXYLPH_C`, `AXYLPH_K`, `AXYLPH_DEDUP`, and `AXYLPH_SERVER`; `AXYLPH_CONFIG` selects the file. Boolean `AXYLPH_DEDUP` accepts `true` or `false`; CLI flags `--dedup` and `--no-dedup` explicitly enable or disable it and conflict with each other.
 
 Bare `axylph` runs `serve`; `axylph send FILE` uses `[send]`. Shared limits and the active command's values are resolved and validated; inactive command settings are not semantically validated, although the whole file must parse with known keys and correct TOML types. Serve-only CLI options cannot be used with `send`. The JSON Schema checks structure and types, not all runtime constraints; runtime validation is authoritative. Regenerate it with `mise run schema` and check it with `mise run schema-check` (also included in `mise run check`). `axylph schema` prints the schema without loading configuration.
 
@@ -65,7 +71,9 @@ The client has a one-batch channel and a parser buffer capped at 2 MiB with the 
 
 The reusable client accepts a blocking `Read` source. Dropping `Client::send` signals cooperative cancellation to the request producer and parser, including a parser waiting for batch-channel capacity. It cannot interrupt an executing `Read::read`; use local files or a source with its own timeout. Once that read returns and cancellation is observed, its bytes are discarded and no subsequent source read is started. Dropping `send` does not wait for the blocking task to finish. Data already handed to the transport may still be accepted, and the receiver may observe request EOF rather than a cancellation status. Cancellation neither rolls back accepted reads nor finalizes the sample.
 
-A peer claiming early completion cannot interrupt a blocked source: `send` may still await the parser to validate the input totals. Callers can impose a timeout by dropping the send future, subject to the same blocking-read limitation. The CLI handles Ctrl-C for receiver shutdown; it does not reconnect or resume an upload.
+A peer claiming early completion cannot interrupt a blocked source: `send` may still await the parser to validate the input totals. Callers can impose a timeout by dropping the send future, subject to the same blocking-read limitation. The CLI does not reconnect or resume an upload.
+
+On Unix, receiver SIGINT or SIGTERM stops listening and drains owned ingestion and profiling work before closing connections. Shutdown does not automatically finish the sample, though an already accepted finish is honored. Final notifications are best-effort; external hard termination can interrupt draining and lose in-memory state.
 
 ## Native interface
 
@@ -77,7 +85,7 @@ Protocol validation checks the whole batch before sketch mutation. A malformed b
 
 A local parser error can look like request EOF to the receiver. The receiver can therefore send a completion receipt even though the source file is invalid. The client checks its parser result and input totals before it reports completion; it returns an error in this case. A receiver receipt alone does not prove that the source file was fully read. Flight uploads have no explicit session-finalization message; Session hosts expose a separate HTTP finish operation.
 
-This interface can change before 1.0. Direct HTTP FASTQ uploads, paired-end sketching, durable recovery, and a GUI are not implemented. Gzip support here is for client input; native network traffic is Arrow, not a FASTQ file. Session-based hosts additionally expose the HTTP finish operation described below.
+This interface can change before 1.0. Direct HTTP FASTQ uploads, paired-end sketching, durable recovery, and a GUI are not implemented. Gzip support here is for client input; native network traffic is Arrow, not a FASTQ file. Session-based hosts, including profiled CLI receivers, additionally expose the HTTP finish operation described below.
 
 ## Observing the sketch
 
@@ -123,9 +131,9 @@ Periodic eligibility is checked before submitting a capture. Each attempt anchor
 
 `shutdown()` closes read admission, stops periodic scheduling, drains admitted blocking work, and awaits active profiling without waiting for upload EOF. Repeated or cancelled waits do not restart or cancel that work. Dropping the owner requests stopping but cannot await synchronous work. The first terminal request wins: shutdown honors an already accepted finish, but finish after shutdown cannot restart the session. Shutdown alone does not finalize the sample or guarantee a profile covering the last read. Library consumers own their runtime and choose the profiler's worker count; neither count is a whole-process CPU quota.
 
-## HTTP observations (library)
+## HTTP observations and finish
 
-`Session::router()` serves Flight over HTTP/2, read-only `GET /events`, and `POST /finish` on the same listener, with HTTP/1.1 or HTTP/2 for the latter routes. `Receiver::router()` remains Flight-only. The CLI still constructs a sketch-only receiver; it does not yet expose profiles, SSE, or HTTP finish. The application must retain its `Session` owner while serving: retaining a router does not keep the worker owner alive, and an SSE disconnect does not stop profiling.
+`Session::router()` serves Flight over HTTP/2, read-only `GET /events`, and `POST /finish` on the same listener, with HTTP/1.1 or HTTP/2 for the latter routes. The CLI exposes these routes when a reference is configured; `Receiver::router()` and the sketch-only CLI remain Flight-only. Library applications must retain their `Session` owner while serving: retaining a router does not keep the worker owner alive, and an SSE disconnect does not stop profiling.
 
 `POST /finish` requires `Content-Type: application/json` and the empty object `{}`. Invalid requests are rejected before closing admission. It awaits the same finish operation as the Rust interface, returning HTTP 200 with the complete `{status, profile}` snapshot on success. A successful profile may still carry an independent `ingestion_error`; it covers accepted evidence, not proof of a complete producer input. The listener remains available after finish, including terminal SSE observations. Repeated finish requests retrieve the retained outcome rather than retrying calculation; disconnected waiters do not cancel an accepted finish. This guarantee lasts only for the current in-memory session, not across process restarts.
 

@@ -1,19 +1,28 @@
 //! Command-line interface for read transfer and cumulative sketching.
 
 mod config;
+mod server;
 
 use std::fs::File;
 
-use axylph::{Client, Receiver};
+use axylph::Client;
 use color_eyre::eyre::WrapErr;
 use config::Command;
-use sylph::read_sketch::{Deduplication, ReadSketcher, SketchParams};
-use tokio::net::TcpListener;
+use sylph::read_sketch::{Deduplication, SketchParams};
 
-#[tokio::main]
-async fn main() -> color_eyre::Result<()> {
+fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     let cli = config::parse()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(config::worker_count())
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run(cli));
+    drop(runtime);
+    result
+}
+
+async fn run(cli: config::Resolved) -> color_eyre::Result<()> {
     let limits = cli.limits;
     match cli.command {
         Command::Schema => config::print_schema()?,
@@ -23,9 +32,18 @@ async fn main() -> color_eyre::Result<()> {
             c,
             k,
             no_dedup,
+            reference,
+            profile_workers,
+            refresh_interval_ms,
         } => {
-            let sketcher = ReadSketcher::new(
-                SketchParams {
+            server::run(server::Settings {
+                listen,
+                sample,
+                limits,
+                reference,
+                workers: profile_workers,
+                interval_ms: refresh_interval_ms,
+                params: SketchParams {
                     c,
                     k,
                     deduplication: if no_dedup {
@@ -34,24 +52,8 @@ async fn main() -> color_eyre::Result<()> {
                         Deduplication::Exact
                     },
                 },
-                "axylph".to_owned(),
-                Some(sample.clone()),
-            )?;
-            let listener = TcpListener::bind(listen)
-                .await
-                .wrap_err_with(|| format!("could not listen on {listen}"))?;
-            eprintln!(
-                "Accumulating sample {sample:?} at http://{} (c={c}, k={k}, dedup={}); no profiling or durable storage",
-                listener.local_addr()?,
-                !no_dedup
-            );
-            axum::serve(listener, Receiver::new(limits, sketcher).router())
-                .with_graceful_shutdown(async {
-                    if let Err(error) = tokio::signal::ctrl_c().await {
-                        eprintln!("Cannot wait for shutdown signal: {error}");
-                    }
-                })
-                .await?;
+            })
+            .await?;
         }
         Command::Send { path, server } => {
             let input =

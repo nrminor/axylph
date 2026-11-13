@@ -16,6 +16,7 @@ axum = { version = "=0.8.9", default-features = false, features = ["http1", "htt
 clap = { version = "=4.6.7", features = ["derive"] }
 color-eyre = { version = "=0.6.5", default-features = false, features = ["track-caller"] }
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
+hyper-util = { version = "=0.1.21", default-features = false, features = ["server-auto", "service", "tokio", "http1", "http2"] }
 flate2 = "=1.1.11"
 seq_io = "=0.3.4"
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -31,7 +32,6 @@ tonic = { version = "=0.14.9", default-features = false, features = ["transport"
 [dev-dependencies]
 http-body-util = "=0.1.5"
 hyper = { version = "=1.12.0", default-features = false, features = ["client", "http1"] }
-hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio"] }
 tokio = { version = "=1.54.1", features = ["test-util", "process"] }
 
 [lints.clippy]

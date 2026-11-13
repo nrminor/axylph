@@ -1,9 +1,12 @@
 //! Configuration precedence through the public binary and Flight upload seams.
 
 use std::{
-    env, fs,
+    env,
+    fmt::Write,
+    fs,
     io::Cursor,
     net::SocketAddr,
+    panic::catch_unwind,
     path::{Path, PathBuf},
     process::{Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -12,11 +15,21 @@ use std::{
 
 use axylph::{Client, Limits, Progress};
 use color_eyre::eyre::{Result, WrapErr, bail, ensure, eyre};
+use http_body_util::{BodyExt, Full, Limited};
+use hyper::{Request, StatusCode, body::Bytes, client::conn::http1};
+use hyper_util::rt::TokioIo;
+use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, BufReader},
+    net::TcpStream,
     process::{ChildStderr, Command},
     time::timeout,
 };
+
+#[path = "support/profile_oracle.rs"]
+mod profile_oracle;
+
+use profile_oracle::{Fixture, Prefix, assert_wire_profile};
 
 const DEADLINE: Duration = Duration::from_secs(5);
 static DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -552,5 +565,380 @@ fn assert_partial_object(schema: &serde_json::Value) -> Result<()> {
             .is_some_and(|properties| !properties.is_empty()),
         "configuration object must describe its fields: {schema}"
     );
+    Ok(())
+}
+
+fn reference_config(directory: &Path, reference: &str) -> Result<PathBuf> {
+    let config_directory = directory.join("config");
+    fs::create_dir(&config_directory)?;
+    fs::create_dir(directory.join("cwd"))?;
+    let config = config_directory.join("service.toml");
+    fs::write(
+        &config,
+        format!(
+            "[serve]\nreference = '{reference}'\nsample = 'synthetic-sample'\nlisten = '127.0.0.1:0'\nc = 20\nk = 31\n"
+        ),
+    )?;
+    Ok(config)
+}
+
+async fn profile_endpoint(stderr: ChildStderr) -> Result<SocketAddr> {
+    let mut lines = BufReader::new(stderr.take(16_384)).lines();
+    let mut diagnostics = String::new();
+    while let Some(line) = lines.next_line().await? {
+        diagnostics.push_str(&line);
+        diagnostics.push('\n');
+        if !line.starts_with("Accumulating sample ") {
+            continue;
+        }
+        for fragment in ["sample \"synthetic-sample\"", "c=20,", "k=31,"] {
+            ensure!(line.contains(fragment), "missing {fragment:?}: {line}");
+        }
+        let endpoint = line
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("http://"))
+            .ok_or_else(|| eyre!("startup omitted endpoint: {line}"))?;
+        let address: SocketAddr = endpoint.parse().wrap_err("parse advertised endpoint")?;
+        ensure!(
+            address.ip().is_loopback() && address.port() != 0,
+            "expected allocated loopback endpoint: {address}"
+        );
+        return Ok(address);
+    }
+    bail!("server closed stderr or exceeded 16 KiB before startup; stderr:\n{diagnostics}")
+}
+
+async fn finish_binary(address: SocketAddr) -> Result<Value> {
+    // Drive the connection inline: cancellation drops both halves, without a detached task.
+    let stream = TcpStream::connect(address).await?;
+    let (mut sender, connection) = http1::handshake(TokioIo::new(stream)).await?;
+    let exchange = async move {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("http://{address}/finish"))
+            .header("content-type", "application/json")
+            .header("connection", "close")
+            .body(Full::new(Bytes::from_static(b"{}")))?;
+        let response = sender.send_request(request).await?;
+        ensure!(response.status() == StatusCode::OK, "finish: {response:?}");
+        ensure!(
+            response
+                .headers()
+                .get("content-type")
+                .is_some_and(|value| value == "application/json"),
+            "finish must return JSON"
+        );
+        ensure!(
+            response
+                .headers()
+                .get("cache-control")
+                .is_some_and(|value| value == "no-store"),
+            "finish must prohibit caching"
+        );
+        let bytes = Limited::new(response.into_body(), 1_048_576)
+            .collect()
+            .await
+            .map_err(|error| eyre!("read bounded finish response: {error}"))?
+            .to_bytes();
+        serde_json::from_slice(&bytes).wrap_err("parse finish JSON")
+    };
+    let (snapshot, ()) = tokio::try_join!(exchange, async {
+        connection.await.wrap_err("drive finish HTTP connection")
+    })?;
+    Ok(snapshot)
+}
+
+async fn verify_binary_profile(address: SocketAddr) -> Result<()> {
+    let fixture: Fixture = serde_json::from_str(include_str!("fixtures/profile/default.json"))?;
+    ensure!(
+        fixture.revision == "1f7fcb53aa20b592d8b3b97f75d9971a60eb06e9"
+            && fixture.c == 20
+            && fixture.k == 31
+            && !fixture.no_dedup,
+        "pinned oracle must match the binary configuration"
+    );
+    let expected: &Prefix = fixture
+        .prefixes
+        .iter()
+        .find(|prefix| prefix.end == 23)
+        .ok_or_else(|| eyre!("pinned oracle lacks prefix 23"))?;
+    ensure!(fixture.reads.len() >= 23, "fixture must contain 23 reads");
+    let mut input = String::new();
+    for (index, read) in fixture.reads.iter().take(23).enumerate() {
+        writeln!(
+            &mut input,
+            "@read-{index}\n{read}\n+\n{}",
+            "I".repeat(read.len())
+        )?;
+    }
+    let receipt = Client::new(format!("http://{address}"), Limits::default())
+        .send(Cursor::new(input.into_bytes()), |_| {})
+        .await?;
+    ensure!(
+        receipt
+            == Progress {
+                reads: 23,
+                bases: 11_730,
+                complete: true
+            },
+        "unexpected Flight receipt: {receipt:?}"
+    );
+    let snapshot = finish_binary(address).await?;
+    let checkpoint = json!({"reads": "23", "bases": "11730"});
+    ensure!(
+        snapshot.get("status")
+            == Some(&json!({
+                "sample_name": "synthetic-sample", "state": "stopped",
+                "processed": checkpoint, "profile_checkpoint": checkpoint,
+                "ingestion_error": null, "refresh_error": null,
+                "finish": {"status": "succeeded", "checkpoint": checkpoint}
+            })),
+        "unexpected terminal status: {snapshot}"
+    );
+    let profile = snapshot
+        .get("profile")
+        .ok_or_else(|| eyre!("missing profile"))?;
+    ensure!(
+        profile.get("checkpoint") == Some(&checkpoint),
+        "wrong profile checkpoint"
+    );
+    // Preserve legacy oracle assertions while ensuring their panics cannot bypass cleanup.
+    catch_unwind(|| assert_wire_profile(profile, expected))
+        .map_err(|_| eyre!("independent wire profile oracle panicked"))?;
+    ensure!(
+        finish_binary(address).await? == snapshot,
+        "a fresh connection must retain the terminal result after finish"
+    );
+    Ok(())
+}
+
+async fn run_reference_binary(directory: &Path, config: &Path) -> Result<()> {
+    let config_argument = config
+        .to_str()
+        .ok_or_else(|| eyre!("non-UTF-8 config path"))?;
+    let mut child = binary(&directory.join("cwd"), &["--config", config_argument], &[])
+        .stdout(Stdio::null())
+        .spawn()?;
+    let outcome = async {
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| eyre!("missing server stderr"))?;
+        let address = timeout(DEADLINE, profile_endpoint(stderr))
+            .await
+            .wrap_err("profile binary must announce startup within five seconds")??;
+        timeout(Duration::from_secs(20), verify_binary_profile(address))
+            .await
+            .wrap_err("Flight upload and HTTP finish must complete within 20 seconds")?
+    }
+    .await;
+    let cleanup = timeout(DEADLINE, child.kill())
+        .await
+        .wrap_err("timed out killing/reaping profile binary")
+        .and_then(|result| result.wrap_err("kill/reap profile binary"));
+    preserve_failure(outcome, cleanup)
+}
+
+#[tokio::test]
+async fn configured_binary_resolves_reference_relative_to_config_and_serves_terminal_profile()
+-> Result<()> {
+    let directory = test_directory()?;
+    let outcome = async {
+        let config = reference_config(&directory, "reference.syldb")?;
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/profile/reference.syldb"),
+            directory.join("config/reference.syldb"),
+        )?;
+        run_reference_binary(&directory, &config).await
+    }
+    .await;
+    preserve_failure(
+        outcome,
+        fs::remove_dir_all(&directory).wrap_err("remove reference CLI fixtures"),
+    )
+}
+
+#[tokio::test]
+async fn configured_binary_rejects_missing_reference_before_announcing_startup() -> Result<()> {
+    let directory = test_directory()?;
+    let outcome = async {
+        let config = reference_config(&directory, "missing.syldb")?;
+        let config_argument = config
+            .to_str()
+            .ok_or_else(|| eyre!("non-UTF-8 config path"))?;
+        let result = output(&directory.join("cwd"), &["--config", config_argument], &[]).await?;
+        let stderr = String::from_utf8(result.stderr)?;
+        ensure!(
+            !result.status.success(),
+            "missing reference must fail startup"
+        );
+        ensure!(
+            stderr.contains("missing.syldb"),
+            "reference failure must identify its path: {stderr}"
+        );
+        ensure!(
+            !stderr.contains("TOML parse error"),
+            "reference must be accepted as configuration before loading fails: {stderr}"
+        );
+        ensure!(
+            !stderr.contains("Accumulating sample "),
+            "must reject reference before startup: {stderr}"
+        );
+        Ok(())
+    }
+    .await;
+    preserve_failure(
+        outcome,
+        fs::remove_dir_all(&directory).wrap_err("remove missing-reference CLI fixtures"),
+    )
+}
+
+#[cfg(unix)]
+async fn signal_binary(pid: u32, signal: &str) -> Result<()> {
+    // Explicit Unix dependency; no shell interpolation or additional signal library.
+    let mut command = Command::new("/bin/kill")
+        .args([signal, &pid.to_string()])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let status = match timeout(DEADLINE, command.wait()).await {
+        Ok(status) => status?,
+        Err(error) => {
+            timeout(DEADLINE, command.kill())
+                .await
+                .wrap_err("timed out killing/reaping /bin/kill")??;
+            return Err(error).wrap_err("/bin/kill must complete within five seconds");
+        }
+    };
+    ensure!(status.success(), "signal {signal} to {pid}: {status}");
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn open_profile_events(address: SocketAddr) -> Result<TcpStream> {
+    let mut stream = TcpStream::connect(address).await?;
+    tokio::io::AsyncWriteExt::write_all(
+        &mut stream,
+        b"GET /events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n",
+    )
+    .await?;
+    let mut reader = BufReader::new(stream.take(16_384));
+    let mut line = String::new();
+    // Read an actual initial SSE snapshot, not merely a successful TCP handshake.
+    for _ in 0..128 {
+        line.clear();
+        ensure!(
+            reader.read_line(&mut line).await? != 0,
+            "SSE closed before initial snapshot"
+        );
+        if let Some(data) = line.strip_prefix("data: ") {
+            let snapshot: Value = serde_json::from_str(data)?;
+            ensure!(
+                snapshot.pointer("/status/state") == Some(&json!("open")),
+                "SSE must start open: {snapshot}"
+            );
+            return Ok(reader.into_inner().into_inner());
+        }
+    }
+    bail!("no initial SSE snapshot within bounded startup response")
+}
+
+#[cfg(unix)]
+async fn require_connection_closed(stream: TcpStream) -> Result<()> {
+    let mut bytes = Vec::new();
+    match stream.take(65_536).read_to_end(&mut bytes).await {
+        Ok(count) => ensure!(
+            count < 65_536,
+            "connection exceeded closure observation budget"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(error) => return Err(error).wrap_err("observe connection closure after shutdown"),
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn run_shutdown_case(directory: &Path, profile: bool, signal: &str) -> Result<()> {
+    let config = reference_config(directory, "reference.syldb")?;
+    if profile {
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/profile/reference.syldb"),
+            directory.join("config/reference.syldb"),
+        )?;
+    } else {
+        fs::write(
+            &config,
+            "[serve]\nsample = 'synthetic-sample'\nlisten = '127.0.0.1:0'\nc = 20\nk = 31\n",
+        )?;
+    }
+    let argument = config.to_str().ok_or_else(|| eyre!("UTF-8 config path"))?;
+    let mut child = binary(&directory.join("cwd"), &["--config", argument], &[])
+        .stdout(Stdio::null())
+        .spawn()?;
+    let outcome = timeout(Duration::from_secs(20), async {
+        let stderr = child.stderr.take().ok_or_else(|| eyre!("missing stderr"))?;
+        let address = profile_endpoint(stderr).await?;
+        let receipt = Client::new(format!("http://{address}"), Limits::default())
+            .send(Cursor::new(b"@one\nACGT\n+\nIIII\n"), |_| {})
+            .await?;
+        ensure!(
+            receipt.reads == 1 && receipt.bases == 4 && receipt.complete,
+            "Flight upload must be acknowledged before shutdown: {receipt:?}"
+        );
+        let mut stalled = TcpStream::connect(address).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut stalled, b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+            .await?;
+        let events = if profile {
+            Some(open_profile_events(address).await?)
+        } else {
+            None
+        };
+        let pid = child
+            .id()
+            .ok_or_else(|| eyre!("server exited before signal"))?;
+        signal_binary(pid, signal).await?;
+        let status = child.wait().await?;
+        ensure!(
+            status.success(),
+            "profile={profile}, signal={signal}: {status}"
+        );
+        ensure!(
+            TcpStream::connect(address).await.is_err(),
+            "listener survived shutdown"
+        );
+        require_connection_closed(stalled).await?;
+        if let Some(events) = events {
+            require_connection_closed(events).await?;
+        }
+        Ok(())
+    })
+    .await
+    .wrap_err_with(|| format!("shutdown timed out: profile={profile}, signal={signal}"))
+    .and_then(|result| result);
+    let cleanup = timeout(DEADLINE, child.kill())
+        .await
+        .wrap_err("timed out killing/reaping shutdown binary")
+        .and_then(|result| result.wrap_err("kill/reap shutdown binary"));
+    preserve_failure(outcome, cleanup)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_signals_exit_both_modes_despite_stalled_http_and_profile_events() -> Result<()> {
+    // Completed upload precedes the signal: this is not an active-work drain race test.
+    // No finish request is issued; producer-EOF independence is not covered here.
+    for profile in [false, true] {
+        for signal in ["-INT", "-TERM"] {
+            let directory = test_directory()?;
+            let outcome = run_shutdown_case(&directory, profile, signal).await;
+            preserve_failure(
+                outcome,
+                fs::remove_dir_all(&directory).wrap_err("remove shutdown CLI fixtures"),
+            )?;
+        }
+    }
     Ok(())
 }

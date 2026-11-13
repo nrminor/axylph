@@ -50,6 +50,19 @@
         "listen": {
           "type": "string"
         },
+        "profile_workers": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "reference": {
+          "type": "string"
+        },
+        "refresh_interval_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
         "sample": {
           "type": "string"
         }

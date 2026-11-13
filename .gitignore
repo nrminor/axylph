@@ -27,12 +27,15 @@
 !/src/main.rs
 !/src/protocol.rs
 !/src/receiver.rs
+!/src/server.rs
 !/src/session.rs
 !/tests/
 !/tests/transfer.rs
 !/tests/cli.rs
 !/tests/accumulation.rs
 !/tests/profiling.rs
+!/tests/support/
+!/tests/support/profile_oracle.rs
 !/tests/fixtures/
 !/tests/fixtures/read-sketch.json
 !/tests/fixtures/profile/
