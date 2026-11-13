@@ -13,7 +13,7 @@ use std::{
 
 use axylph::{Client, Limits, Session};
 use futures_util::{FutureExt, StreamExt};
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Empty, Full};
 use hyper::{
     Request, StatusCode,
     body::{Bytes, Incoming},
@@ -30,6 +30,7 @@ use sylph::{
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::oneshot,
+    task::JoinHandle,
     time::timeout,
 };
 
@@ -400,6 +401,249 @@ async fn events_publish_initial_state_then_an_independently_verified_profile() {
             Err(error) => assert!(error.is_cancelled(), "HTTP driver panicked: {error}"),
         }
     }
+}
+
+#[tokio::test]
+async fn http_finish_returns_and_retains_an_independently_verified_terminal_profile() {
+    let fixture: Fixture = serde_json::from_str(include_str!("fixtures/profile/default.json"))
+        .expect("pinned profile fixture must deserialize");
+    assert_eq!(fixture.revision, "1f7fcb53aa20b592d8b3b97f75d9971a60eb06e9");
+    let expected = fixture
+        .prefixes
+        .iter()
+        .find(|prefix| prefix.end == 23)
+        .expect("independent fixture must contain the prefix-23 oracle");
+    let mut input = String::new();
+    for (i, read) in fixture.reads.iter().take(23).enumerate() {
+        writeln!(
+            &mut input,
+            "@read-{i}\n{read}\n+\n{}",
+            "I".repeat(read.len())
+        )
+        .expect("FASTQ fixture formatting must succeed");
+    }
+    let database =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/profile/reference.syldb");
+    let profiler = Profiler::open_syldb(database, ProfileOptions::default(), 1)
+        .expect("pinned reference database must open");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("HTTP finish tracer must bind a loopback listener");
+    let address = listener.local_addr().expect("bound listener address");
+    let session = Session::builder("synthetic-sample", profiler)
+        .c(fixture.c)
+        .k(fixture.k)
+        .deduplication(if fixture.no_dedup {
+            Deduplication::Disabled
+        } else {
+            Deduplication::Exact
+        })
+        .refresh_interval(Duration::from_secs(3600))
+        .start()
+        .expect("fixture profiling session must start");
+    let router = session.router();
+    let (stop, stopped) = oneshot::channel();
+    let mut server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let mut driver = None;
+    let outcome = AssertUnwindSafe(timeout(Duration::from_secs(20), async {
+        assert_http_finish_journey(&mut driver, address, input, expected).await;
+    }))
+    .catch_unwind()
+    .await;
+    let cleanup = AssertUnwindSafe(timeout(Duration::from_secs(10), async {
+        let connection_result = if let Some(connection) = driver.as_mut() {
+            if let Ok(result) = timeout(Duration::from_secs(2), &mut *connection).await {
+                Some(result)
+            } else {
+                connection.abort();
+                Some(
+                    timeout(Duration::from_secs(2), connection)
+                        .await
+                        .expect("aborted HTTP driver must terminate"),
+                )
+            }
+        } else {
+            None
+        };
+        driver = None;
+        let drained = session.shutdown().await;
+        let _ = stop.send(());
+        let transport_result = (&mut server).await;
+        (connection_result, drained, transport_result)
+    }))
+    .catch_unwind()
+    .await;
+    if !matches!(&cleanup, Ok(Ok(_))) {
+        server.abort();
+        if let Some(connection) = driver.as_mut() {
+            connection.abort();
+            let _ = timeout(Duration::from_secs(2), connection).await;
+        }
+        let _ = timeout(Duration::from_secs(2), &mut server).await;
+    }
+    // Preserve the journey's original assertion failure even if cleanup also fails.
+    match outcome {
+        Ok(result) => result.expect("HTTP finish tracer must complete within 20 seconds"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+    let (connection_result, drained, transport_result) = match cleanup {
+        Ok(result) => result.expect("HTTP driver, session and server must drain within 10 seconds"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    drained.expect("finished session must shut down cleanly");
+    transport_result
+        .expect("HTTP server task must not panic")
+        .expect("HTTP server must shut down cleanly");
+    if let Some(result) = connection_result {
+        match result {
+            Ok(result) => result.expect("HTTP driver must close cleanly"),
+            Err(error) => assert!(error.is_cancelled(), "HTTP driver panicked: {error}"),
+        }
+    }
+}
+
+async fn assert_invalid_finish_requests(
+    sender: &mut http1::SendRequest<Full<Bytes>>,
+    address: SocketAddr,
+) {
+    for (body, content_type) in [
+        ("{", Some("application/json")),
+        ("", Some("application/json")),
+        ("null", Some("application/json")),
+        ("[]", Some("application/json")),
+        ("{\"unexpected\":true}", Some("application/json")),
+        ("{}", None),
+    ] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(format!("http://{address}/finish"));
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type);
+        }
+        let response = sender
+            .send_request(
+                request
+                    .body(Full::new(Bytes::from_static(body.as_bytes())))
+                    .expect("invalid finish request must build"),
+            )
+            .await
+            .expect("invalid finish request must receive a response");
+        assert!(
+            response.status().is_client_error(),
+            "invalid finish input accepted: {body:?}"
+        );
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("invalid finish response must be readable")
+            .to_bytes();
+        let error: Value = serde_json::from_slice(&bytes)
+            .expect("invalid finish response must use the JSON error envelope");
+        assert_eq!(error["error"]["code"], "invalid_finish_request");
+        assert_ne!(
+            error["error"]["message"]
+                .as_str()
+                .expect("invalid finish error must have a message"),
+            ""
+        );
+    }
+}
+
+async fn assert_http_finish_journey(
+    driver: &mut Option<JoinHandle<Result<(), hyper::Error>>>,
+    address: SocketAddr,
+    input: String,
+    expected: &Prefix,
+) {
+    let stream = TcpStream::connect(address)
+        .await
+        .expect("HTTP client must connect to the session listener");
+    let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
+        .await
+        .expect("HTTP/1 handshake must succeed");
+    *driver = Some(tokio::spawn(connection));
+    assert_invalid_finish_requests(&mut sender, address).await;
+    // Rejected requests must not close ingestion: a real upload must still succeed.
+    let receipt = Client::new(format!("http://{address}"), Limits::default())
+        .send(Cursor::new(input.into_bytes()), |_| {})
+        .await
+        .expect(
+            "real Flight upload must accept the 23 fixture reads after invalid finish requests",
+        );
+    assert!(receipt.complete);
+    let checkpoint = json!({"reads": "23", "bases": "11730"});
+    let terminal_status = json!({
+        "sample_name": "synthetic-sample", "state": "stopped",
+        "processed": checkpoint, "profile_checkpoint": checkpoint,
+        "ingestion_error": null, "refresh_error": null,
+        "finish": {"status": "succeeded", "checkpoint": checkpoint}
+    });
+    let mut retained = None;
+    // Finish must produce the terminal result without waiting for a periodic refresh.
+    for _ in 0..2 {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("http://{address}/finish"))
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from_static(b"{}")))
+            .expect("JSON finish request must build");
+        let response = sender
+            .send_request(request)
+            .await
+            .expect("HTTP finish request must receive a response");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "POST /finish must succeed"
+        );
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("complete finish JSON body must be readable")
+            .to_bytes();
+        let snapshot: Value =
+            serde_json::from_slice(&bytes).expect("finish response must be a full JSON snapshot");
+        assert_eq!(snapshot["status"], terminal_status);
+        assert_eq!(snapshot["profile"]["checkpoint"], checkpoint);
+        assert_wire_profile(&snapshot["profile"], expected);
+        if let Some(previous) = &retained {
+            assert_eq!(
+                &snapshot, previous,
+                "repeated finish must retain the same result"
+            );
+        }
+        retained = Some(snapshot);
+    }
+    let request = Request::builder()
+        .uri(format!("http://{address}/events"))
+        .header("accept", "text/event-stream")
+        .body(Full::new(Bytes::new()))
+        .expect("terminal SSE request must build");
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("listener must still serve events after repeated finish");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let mut events = SseReader {
+        body: response.into_body(),
+        pending: Vec::new(),
+    };
+    let (name, terminal) = events.next().await;
+    assert_eq!(name, "snapshot");
+    assert_eq!(Some(&terminal), retained.as_ref());
 }
 
 async fn assert_sse_journey(

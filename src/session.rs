@@ -156,6 +156,28 @@ pub struct Session {
     worker: Shared<BoxFuture<'static, Result<(), Arc<Error>>>>,
 }
 
+// A finish capability shares completion bookkeeping, never the session owner.
+#[derive(Clone)]
+pub struct FinishHandle {
+    ingestion: Arc<Ingestion>,
+    worker: Shared<BoxFuture<'static, Result<(), Arc<Error>>>>,
+}
+
+impl FinishHandle {
+    pub async fn finish(&self) -> Result<Arc<ProfileSnapshot>, Arc<Error>> {
+        if self.ingestion.close(CloseReason::Finish) != CloseReason::Finish {
+            return Err(Arc::new(Error::SessionClosed));
+        }
+        self.worker.clone().await?;
+        self.ingestion
+            .observations
+            .borrow()
+            .finish_outcome
+            .clone()
+            .ok_or_else(|| Arc::new(Error::SessionClosed))?
+    }
+}
+
 impl Session {
     /// Configure a fresh sample with sylph's defaults and one-second capture-start spacing.
     /// The supplied profiler already owns its references, options, and worker pool.
@@ -255,7 +277,8 @@ impl Session {
         self.receiver.clone()
     }
 
-    /// Serve Flight uploads and read-only server-sent observations at `GET /events`.
+    /// Serve Flight, read-only observations at `GET /events`, and `POST /finish`.
+    /// Finish requires an empty JSON object and waits for the retained outcome.
     /// Each subscription starts with a complete snapshot, then receives coalesced
     /// snapshot or status replacements. Reconnection resynchronizes without replay.
     /// Retaining this router does not retain the session owner: dropping the owner
@@ -266,6 +289,7 @@ impl Session {
             self.receiver().router(),
             Arc::clone(&self.sample_name),
             self.receiver.ingestion.observations.subscribe(),
+            self.finish_handle(),
         )
     }
 
@@ -285,17 +309,14 @@ impl Session {
     /// Rejects finish after shutdown won admission closure. A failed calculation leaves
     /// admission closed, preserves any older profile as non-final, and records the failure.
     pub async fn finish(&self) -> Result<Arc<ProfileSnapshot>, Arc<Error>> {
-        if self.receiver.ingestion.close(CloseReason::Finish) != CloseReason::Finish {
-            return Err(Arc::new(Error::SessionClosed));
+        self.finish_handle().finish().await
+    }
+
+    fn finish_handle(&self) -> FinishHandle {
+        FinishHandle {
+            ingestion: Arc::clone(&self.receiver.ingestion),
+            worker: self.worker.clone(),
         }
-        self.worker.clone().await?;
-        self.receiver
-            .ingestion
-            .observations
-            .borrow()
-            .finish_outcome
-            .clone()
-            .ok_or_else(|| Arc::new(Error::SessionClosed))?
     }
 
     /// Close admission, stop periodic scheduling, and await admitted work.

@@ -51,9 +51,9 @@ The experimental version 0 schema has three Arrow `Binary` columns: non-null `id
 
 Protocol validation checks the whole batch before sketch mutation. A malformed batch adds no reads, and later uploads may continue. A scientific counter-limit error can retain complete earlier reads from that batch without emitting a receipt for it; it stops further ingestion, but the accepted sketch remains inspectable. A panic while holding the sketch lock prevents reuse or inspection of potentially inconsistent state. There is no automatic reset.
 
-A local parser error can look like request EOF to the receiver. The receiver can therefore send a completion receipt even though the source file is invalid. The client checks its parser result and input totals before it reports completion; it returns an error in this case. A receiver receipt alone does not prove that the source file was fully read. This transport prototype has no explicit session-finalization message.
+A local parser error can look like request EOF to the receiver. The receiver can therefore send a completion receipt even though the source file is invalid. The client checks its parser result and input totals before it reports completion; it returns an error in this case. A receiver receipt alone does not prove that the source file was fully read. Flight uploads have no explicit session-finalization message; Session hosts expose a separate HTTP finish operation.
 
-This interface can change before 1.0. Direct HTTP FASTQ uploads, paired-end sketching, HTTP control operations, durable recovery, and a GUI are not implemented. Gzip support here is for client input; native network traffic is Arrow, not a FASTQ file.
+This interface can change before 1.0. Direct HTTP FASTQ uploads, paired-end sketching, durable recovery, and a GUI are not implemented. Gzip support here is for client input; native network traffic is Arrow, not a FASTQ file. Session-based hosts additionally expose the HTTP finish operation described below.
 
 ## Observing the sketch
 
@@ -79,7 +79,7 @@ A session owns the analysis; its receiver delivers reads to it. Supply a loaded 
 let session = Session::builder("sample-1", profiler)
     .c(50)
     .start()?;
-let app = session.router(); // Flight uploads plus read-only GET /events.
+let app = session.router(); // Flight uploads, GET /events, and POST /finish.
 let observations = session.observe();
 // Serve app and consume observations on your runtime.
 // When the operator explicitly finishes the sample:
@@ -101,7 +101,11 @@ Periodic eligibility is checked before submitting a capture. Each attempt anchor
 
 ## HTTP observations (library)
 
-`Session::router()` serves Flight over HTTP/2 and read-only `GET /events` over HTTP/1.1 or HTTP/2 on the same listener. `Receiver::router()` remains Flight-only. The CLI still constructs a sketch-only receiver; it does not yet expose profiles or SSE. The application must retain its `Session` owner while serving: retaining a router does not keep the worker owner alive, and an SSE disconnect does not stop profiling.
+`Session::router()` serves Flight over HTTP/2, read-only `GET /events`, and `POST /finish` on the same listener, with HTTP/1.1 or HTTP/2 for the latter routes. `Receiver::router()` remains Flight-only. The CLI still constructs a sketch-only receiver; it does not yet expose profiles, SSE, or HTTP finish. The application must retain its `Session` owner while serving: retaining a router does not keep the worker owner alive, and an SSE disconnect does not stop profiling.
+
+`POST /finish` requires `Content-Type: application/json` and the empty object `{}`. Invalid requests are rejected before closing admission. It awaits the same finish operation as the Rust interface, returning HTTP 200 with the complete `{status, profile}` snapshot on success. A successful profile may still carry an independent `ingestion_error`; it covers accepted evidence, not proof of a complete producer input. The listener remains available after finish, including terminal SSE observations. Repeated finish requests retrieve the retained outcome rather than retrying calculation; disconnected waiters do not cancel an accepted finish. This guarantee lasts only for the current in-memory session, not across process restarts.
+
+Finish failures return `{ "error": { "code": ..., "message": ... } }`: HTTP 409 if shutdown already won, 422 for a scientific profiling failure, and 500 for internal/task failures. Invalid request bodies use 400/415/422 (or 413 for the body limit) with code `invalid_finish_request`. Responses use `Cache-Control: no-store`. No shutdown/reset endpoint or permissive cross-origin policy is installed. This is a trusted-network control operation, not an authenticated endpoint; hosts must supply access control before exposing it outside that environment.
 
 `/events` returns `text/event-stream` with JSON data, keepalive comments, and `Cache-Control: no-store`. Each connection starts with a `snapshot` event containing `{ "status": ..., "profile": ... }`. Later `snapshot` events replace the entire client view when the profile changes; `status` events replace only its metadata. All fields in a message come from one immutable observation. Intermediate observations may be skipped, but a new profile is included before metadata can refer to it. Reconnection starts from current state without replay, event IDs, or a separate initial GET. A `profile: null` clears any previously displayed result; a successful empty profile instead has empty `rows`.
 
@@ -111,7 +115,7 @@ Profiles include their checkpoint, sample name, scientific options, and complete
 
 Routine progress-only events are spaced at least 250 ms after the preceding event on each subscription, coalescing pending progress to the latest state. Initial snapshots, new profiles, and error/lifecycle/finish changes bypass that wait, carry current progress, and restart the progress interval. This limits server stream emissions, not network arrival times; backpressure and proxy buffering can delay or bunch deliveries. No queue of old observations is retained. Scientific start spacing is separate from per-subscriber delivery cadence; subscriptions never schedule calculations.
 
-Reconnection, slow-client behavior, HTTP finality, and error paths need subsequent focused tests. Profile serialization borrows the scientific rows, but each connection owns its serialized payload; large-payload CPU/memory costs and deployment proxy buffering have not been measured. Authentication, TLS, and cross-origin policy remain the host application's responsibility.
+Reconnection, slow-client behavior, HTTP cancellation/races, and scientific failure paths need subsequent focused tests. Profile serialization borrows the scientific rows, but each connection owns its serialized payload; large-payload CPU/memory costs and deployment proxy buffering have not been measured. Authentication, TLS, and cross-origin policy remain the host application's responsibility.
 
 ## Development
 
@@ -127,6 +131,8 @@ mise run ci-validate
 `check` runs formatting, Clippy, nextest, documentation checks, and doctests when `src/lib.rs` exists. Tests exercise the client/server interface and public Flight input handling. Accumulation, profile-publication, and finish tests use checked-in expectations generated from unchanged upstream revision `1f7fcb53aa20b592d8b3b97f75d9971a60eb06e9`; they do not run the adapted code to generate their oracle. The JSON fixtures record provenance, checksums, and generation environment. The profiling tracers cover 23 synthetic reads and their cumulative profile at CLI precision, including library finality retained after shutdown and a real HTTP/1.1 SSE subscription alongside HTTP/2 Flight on one listener. The SSE tracer checks initial absence and independently expected profile values; it does not establish reconnect or delivery-rate behavior. These checks do not establish unrounded equivalence, overlapping computation/ingestion, lifecycle-race behavior, or large-workload performance. Build and verification tasks use `Cargo.lock` without updating dependencies.
 
 Controlled-clock internal tests exercise progress coalescing and a lifecycle change bypassing pending progress on the real SSE response body with a controlled observation source. They establish server emission eligibility at the 250 ms boundary, not TCP arrival spacing or scientific scheduling. The end-to-end tracer remains the independent transport/scientific check.
+
+A real Flight-to-HTTP finish tracer rejects invalid control requests without closing admission, checks the terminal prefix-23 profile against the independent oracle, repeats finish, and reads the same terminal snapshot over SSE while the listener stays available. It does not prove concurrent finish/shutdown ordering, disconnected waiter behavior, or scientific failure handling over HTTP.
 
 A separate internal cadence test checks periodic eligibility from supplied capture-start times, including a calculation longer than its interval, a later short calculation, and idle polling. It does not instrument actual capture starts or establish end-to-end timing; timestamp placement and worker wiring are separately reviewed. These are policy correctness tests, not performance measurements.
 

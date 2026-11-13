@@ -1,16 +1,17 @@
 use std::{fmt::Display, sync::Arc, time::Duration};
 
 use axum::{
-    Router,
-    extract::State,
-    http::header,
+    Json, Router,
+    extract::{State, rejection::JsonRejection},
+    http::{StatusCode, header},
     response::{
         IntoResponse, Sse,
         sse::{Event, KeepAlive},
     },
-    routing::get,
+    routing::{get, post},
 };
 use serde::{Serialize, Serializer, ser::SerializeStruct};
+use serde_json::{Map, Value};
 use sylph::{
     profile::{ProfileMode, ProfileOptions, ProfileRow, SequenceEstimate},
     types::AdjustStatus,
@@ -19,6 +20,7 @@ use tokio::{sync::watch, time::Instant};
 
 use crate::{
     Error, Observation, ProcessedCheckpoint, ProfileSnapshot, RefreshFailure, SessionState,
+    session::FinishHandle,
 };
 
 #[derive(Clone)]
@@ -27,19 +29,86 @@ struct Source {
     updates: watch::Receiver<Arc<Observation>>,
 }
 
+#[derive(Clone)]
+struct FinishEndpoint {
+    observations: Source,
+    operation: FinishHandle,
+}
+
+#[derive(Serialize)]
+struct FinishError {
+    error: Failure,
+}
+
+async fn finish(
+    State(endpoint): State<FinishEndpoint>,
+    request: Result<Json<Map<String, Value>>, JsonRejection>,
+) -> impl IntoResponse {
+    let response = match request {
+        Ok(Json(request)) if request.is_empty() => match endpoint.operation.finish().await {
+            Ok(_) => {
+                let observation = Arc::clone(&endpoint.observations.updates.borrow());
+                let status = Status::new(&endpoint.observations.sample_name, &observation);
+                let profile = observation.snapshot().map(|profile| ProfileData(profile));
+                let snapshot = Snapshot { status, profile };
+                Json(snapshot).into_response()
+            }
+            Err(error) => {
+                let status = match error.as_ref() {
+                    Error::SessionClosed => StatusCode::CONFLICT,
+                    Error::Profile(_) => StatusCode::UNPROCESSABLE_ENTITY,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                let failure = Failure::from(error.as_ref());
+                let body = FinishError { error: failure };
+                (status, Json(body)).into_response()
+            }
+        },
+        Ok(_) => {
+            let failure = Failure {
+                code: "invalid_finish_request",
+                message: "expected an empty JSON object".to_owned(),
+            };
+            let body = FinishError { error: failure };
+            (StatusCode::BAD_REQUEST, Json(body)).into_response()
+        }
+        Err(error) => {
+            let status = error.status();
+            let failure = Failure {
+                code: "invalid_finish_request",
+                message: error.body_text(),
+            };
+            let body = FinishError { error: failure };
+            (status, Json(body)).into_response()
+        }
+    };
+    ([(header::CACHE_CONTROL, "no-store")], response)
+}
+
 pub fn router(
     flight: Router,
     sample_name: Arc<str>,
     updates: watch::Receiver<Arc<Observation>>,
+    operation: FinishHandle,
 ) -> Router {
-    flight.merge(
-        Router::new()
-            .route("/events", get(events))
-            .with_state(Source {
-                sample_name,
-                updates,
-            }),
-    )
+    let source = Source {
+        sample_name,
+        updates,
+    };
+    flight
+        .merge(
+            Router::new()
+                .route("/events", get(events))
+                .with_state(source.clone()),
+        )
+        .merge(
+            Router::new()
+                .route("/finish", post(finish))
+                .with_state(FinishEndpoint {
+                    observations: source,
+                    operation,
+                }),
+        )
 }
 
 async fn events(State(mut source): State<Source>) -> impl IntoResponse {
