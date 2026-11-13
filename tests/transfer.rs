@@ -1,8 +1,12 @@
-//! Read transfer through the same client and server interfaces used by applications.
+//! Read transfer and receiver lifecycle through public application interfaces.
+
+#![cfg(test)]
 
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     io::{self, Cursor, Read, Write},
+    panic::AssertUnwindSafe,
     sync::{Arc, mpsc},
     time::Duration,
 };
@@ -11,9 +15,10 @@ use arrow_array::{BinaryArray, RecordBatch};
 use arrow_flight::{FlightClient, encode::FlightDataEncoderBuilder};
 use arrow_schema::{DataType, Field, Schema};
 use axum::{Router, body::Body, http::Response, routing::post};
-use axylph::{Client, Error, Limits, Progress, Receiver};
+use axylph::{Client, Error, IngestionStatus, Limits, ProcessedCheckpoint, Progress, Receiver};
 use flate2::{Compression, write::GzEncoder};
-use futures_util::{StreamExt, stream};
+use futures_util::{FutureExt, StreamExt, stream};
+use serde::Deserialize;
 use sylph::read_sketch::{Deduplication, ReadSketcher, SketchError, SketchParams};
 use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 use tonic::{Code, transport::Endpoint};
@@ -78,6 +83,151 @@ impl Drop for GatedInput {
             let _ = dropped.send(self.consumed_suffix);
         }
     }
+}
+
+#[derive(Deserialize)]
+struct LifecycleFixture {
+    revision: String,
+    c: usize,
+    k: usize,
+    no_dedup: bool,
+    reads: Vec<String>,
+}
+
+#[track_caller]
+fn assert_ingestion_status(status: IngestionStatus, reads: u64, bases: u64) {
+    let processed: ProcessedCheckpoint = status.processed;
+    let ingestion_error: Option<Arc<Error>> = status.ingestion_error;
+    assert_eq!(processed.reads(), reads, "processed read checkpoint");
+    assert_eq!(processed.bases(), bases, "processed base checkpoint");
+    assert!(
+        ingestion_error.is_none(),
+        "unexpected ingestion failure: {ingestion_error:?}"
+    );
+}
+
+fn lifecycle_receiver_and_input() -> (Receiver, Limits, Vec<u8>) {
+    let fixture: LifecycleFixture =
+        serde_json::from_str(include_str!("fixtures/profile/default.json"))
+            .expect("pinned real-read fixture must deserialize");
+    assert_eq!(fixture.revision, "1f7fcb53aa20b592d8b3b97f75d9971a60eb06e9");
+    assert!(
+        fixture.reads.len() >= 32,
+        "fixture needs buffered lookahead records"
+    );
+    let limits = Limits::new(1_048_576, 23).expect("23-read batch limits must be valid");
+    let receiver = Receiver::new(
+        limits,
+        ReadSketcher::new(
+            SketchParams {
+                c: fixture.c,
+                k: fixture.k,
+                deduplication: if fixture.no_dedup {
+                    Deduplication::Disabled
+                } else {
+                    Deduplication::Exact
+                },
+            },
+            "lifecycle.fastq".to_owned(),
+            None,
+        )
+        .expect("fixture sketch parameters must be valid"),
+    );
+    let mut input = String::new();
+    // The client needs lookahead to flush its full batch, and the FASTQ parser
+    // refills its buffer before returning its last records. Supply enough for
+    // both, but fewer than 46 reads: only the first 23 can reach Flight pre-EOF.
+    for (i, read) in fixture.reads.iter().take(32).enumerate() {
+        writeln!(
+            &mut input,
+            "@read-{i}\n{read}\n+\n{}",
+            "I".repeat(read.len())
+        )
+        .expect("formatting fixture FASTQ must succeed");
+    }
+    (receiver, limits, input.into_bytes())
+}
+
+#[tokio::test]
+async fn closes_and_drains_processed_flight_input_without_waiting_for_producer_eof() {
+    let (receiver, limits, input) = lifecycle_receiver_and_input();
+    let (blocked, blocked_input) = oneshot::channel();
+    let (release, gate) = mpsc::channel();
+    let (dropped, dropped_input) = oneshot::channel();
+    let input = GatedInput {
+        prefix: Cursor::new(input),
+        blocked: Some(blocked),
+        release: gate,
+        resumed: Cursor::new(Vec::new()),
+        suffix: Cursor::new(Vec::new()),
+        consumed_suffix: false,
+        dropped: Some(dropped),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind Flight listener");
+    let address = listener.local_addr().expect("read Flight listener address");
+    let router = receiver.clone().router();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+    let client = Client::new(format!("http://{address}"), limits);
+    let (receipt, accepted) = oneshot::channel();
+    let mut receipt = Some(receipt);
+    let mut upload = Box::pin(client.send(input, move |progress| {
+        if !progress.complete
+            && let Some(receipt) = receipt.take()
+        {
+            let _ = receipt.send(progress);
+        }
+    }));
+    let outcome = AssertUnwindSafe(timeout(Duration::from_secs(10), async {
+        assert_ingestion_status(receiver.ingestion_status(), 0, 0);
+        let ((), progress) = timeout(Duration::from_secs(5), async { tokio::select! {
+            ready = async { tokio::try_join!(blocked_input, accepted) } =>
+                ready.expect("reader must block and Flight must acknowledge processing"),
+            result = &mut upload => panic!("upload ended before producer EOF was released: {result:?}"),
+        }}).await.expect("blocked producer must receive its 23-read processing receipt");
+        assert_eq!(progress, Progress { reads: 23, bases: 11_730, complete: false });
+        let accepted_status: IngestionStatus = receiver.ingestion_status();
+        assert_ingestion_status(receiver.ingestion_status(), 23, 11_730);
+        // Keep both the upload future and the EOF gate alive throughout closure.
+        timeout(Duration::from_secs(2), receiver.close_and_drain()).await
+            .expect("receiver drain must not wait for producer EOF");
+        assert_ingestion_status(receiver.ingestion_status(), 23, 11_730);
+        let rejected = client.send(Cursor::new(b"@new\nACGT\n+\nIIII\n"), |_| {}).await
+            .expect_err("closed receiver must reject a new upload");
+        assert!(matches!(rejected,
+            Error::Flight(arrow_flight::error::FlightError::Tonic(ref status))
+                if status.code() == Code::Unavailable), "closed admission: {rejected:?}");
+        receiver.clone().close_and_drain().await;
+        receiver.close_and_drain().await;
+        assert_ingestion_status(receiver.ingestion_status(), 23, 11_730);
+        assert_ingestion_status(accepted_status, 23, 11_730);
+    })).catch_unwind().await;
+
+    // Cancel before releasing EOF so the lookahead cannot become another batch.
+    // Always release the blocking reader, even after assertions or timeouts.
+    drop(upload);
+    drop(release);
+    let source_cleanup = timeout(Duration::from_secs(5), dropped_input).await;
+    server.abort();
+    let server_cleanup = timeout(Duration::from_secs(5), server).await;
+    // Preserve the original failure rather than replacing it with a cleanup error.
+    match outcome {
+        Ok(result) => result.expect("receiver lifecycle must complete within 10 seconds"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+    assert!(
+        !source_cleanup
+            .expect("released reader must finish within five seconds")
+            .expect("released source must report its destruction")
+    );
+    let server_error = server_cleanup
+        .expect("aborted server must stop within five seconds")
+        .expect_err("test server should stop by cancellation");
+    assert!(
+        server_error.is_cancelled(),
+        "Flight server panicked: {server_error}"
+    );
 }
 
 #[tokio::test]

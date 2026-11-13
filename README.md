@@ -67,6 +67,10 @@ let marker_count = receiver.inspect(|sketch| sketch.kmer_counts.len()).await?;
 
 Clones share the accumulator and upload gate. `inspect` borrows a consistent processed prefix on a blocking thread; it neither copies the marker map nor resets duplicate history. It can run between batches of a live upload. Pending batches need not appear yet. Return only the owned information needed and keep callbacks short: ingestion waits for the callback's lock. Do not re-enter the receiver from a callback. Dropping the observation future does not stop a submitted callback. No sketch retrieval endpoint is exposed over the network.
 
+`Receiver::ingestion_status()` returns owned, coherent `processed` and `ingestion_error` metadata without copying the sketch or retaining profile rows. These exact processed totals are distinct from sampled marker counts and upload-local receipts. A recorded failure does not discard the accepted prefix.
+
+`Receiver::close_and_drain().await` permanently closes admission across its clones and waits for admitted ingestion, not producer EOF, network delivery, or profiling completion. Repeated calls are safe; cancelling the wait does not reopen admission. For a session-backed receiver this requests shutdown, not finish: an already accepted finish is honored, but closing first prevents a later finish. Use `Session::shutdown()` when analysis must also be awaited. Draining alone does not certify successful ingestion.
+
 ## Observing cumulative profiles
 
 A session owns the analysis; its receiver delivers reads to it. Supply a loaded `sylph::profile::Profiler` with fixed references, options, and an explicitly sized local worker pool, then start a fresh sample on your Tokio runtime (with its time driver enabled):

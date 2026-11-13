@@ -38,6 +38,16 @@ pub struct Receiver {
     pub(crate) ingestion: Arc<Ingestion>,
 }
 
+/// Coherent ingestion metadata, independent of scientific profile ownership.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct IngestionStatus {
+    /// Exact totals for a completely processed prefix, including duplicates.
+    pub processed: ProcessedCheckpoint,
+    /// Recorded ingestion or worker failure, without discarding accepted totals.
+    pub ingestion_error: Option<Arc<Error>>,
+}
+
 pub struct Ingestion {
     upload: Arc<Semaphore>,
     state: Mutex<SketchState>,
@@ -213,26 +223,56 @@ impl SketchState {
 }
 
 impl Receiver {
+    /// Read a coherent checkpoint and recorded failure without copying the sketch.
+    /// The owned metadata retains no scientific profile rows and does not keep
+    /// the ingestion lock held. Reading it does not schedule computation.
+    #[must_use]
+    pub fn ingestion_status(&self) -> IngestionStatus {
+        let observation = self.ingestion.observations.borrow();
+        IngestionStatus {
+            processed: observation.processed,
+            ingestion_error: observation.ingestion_error.clone(),
+        }
+    }
+
+    /// Permanently close admission across clones and await admitted ingestion work.
+    /// Does not wait for producer EOF, response delivery, or profiling completion.
+    /// Repeated calls are safe; cancelling the wait does not reopen admission.
+    ///
+    /// For a session-backed receiver this requests shutdown, not finalization.
+    /// An already accepted finish is honored, but closing first prevents a later
+    /// finish. Use [`crate::Session::shutdown`] to also await session analysis.
+    /// Completion means ingestion has drained, not that ingestion succeeded.
+    pub async fn close_and_drain(&self) {
+        self.ingestion.close(CloseReason::Shutdown);
+        self.ingestion.drain().await;
+    }
+
     /// Adopt a configured accumulator and limits for each incoming batch.
     ///
     /// All uploads belong to this one sample. Its parameters and identity come
     /// from `sketcher` and cannot be changed by clients.
     #[must_use]
     pub fn new(limits: Limits, sketcher: ReadSketcher) -> Self {
-        Self {
-            limits,
-            ingestion: Arc::new(Ingestion {
-                upload: Arc::new(Semaphore::new(1)),
-                state: Mutex::new(SketchState {
-                    sketcher,
-                    processed: ProcessedCheckpoint::default(),
-                    failure: None,
-                }),
-                work: Arc::new(AsyncMutex::new(())),
-                closed: watch::channel(None).0,
-                observations: watch::channel(Arc::new(Observation::default())).0,
-            }),
-        }
+        let upload = Arc::new(Semaphore::new(1));
+        let sketch_state = SketchState {
+            sketcher,
+            processed: ProcessedCheckpoint::default(),
+            failure: None,
+        };
+        let state = Mutex::new(sketch_state);
+        let work = Arc::new(AsyncMutex::new(()));
+        let closed = watch::channel(None).0;
+        let observation = Arc::new(Observation::default());
+        let observations = watch::channel(observation).0;
+        let ingestion = Arc::new(Ingestion {
+            upload,
+            state,
+            work,
+            closed,
+            observations,
+        });
+        Self { limits, ingestion }
     }
 
     /// Observe a consistent processed prefix on a blocking thread.

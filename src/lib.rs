@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 pub use client::Client;
 pub use error::Error;
-pub use receiver::Receiver;
+pub use receiver::{IngestionStatus, Receiver};
 pub use session::{
     Observation, ProcessedCheckpoint, ProfileSnapshot, RefreshFailure, Session, SessionBuilder,
     SessionState,
