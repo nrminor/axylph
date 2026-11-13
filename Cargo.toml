@@ -12,7 +12,7 @@ arrow-flight = { version = "=60.1.0", default-features = false }
 arrow-ipc = { version = "=60.1.0", default-features = false }
 arrow-schema = "=60.1.0"
 async-stream = "=0.3.6"
-axum = { version = "=0.8.9", default-features = false, features = ["http2", "tokio"] }
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "http2", "json", "tokio"] }
 clap = { version = "=4.6.7", features = ["derive"] }
 color-eyre = { version = "=0.6.5", default-features = false, features = ["track-caller"] }
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
@@ -25,6 +25,11 @@ thiserror = "=2.0.21"
 tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "net", "sync", "signal", "time", "io-util"] }
 tokio-stream = { version = "=0.1.19", default-features = false }
 tonic = { version = "=0.14.9", default-features = false, features = ["transport", "router", "codegen"] }
+
+[dev-dependencies]
+http-body-util = "=0.1.5"
+hyper = { version = "=1.12.0", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio"] }
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }

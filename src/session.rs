@@ -10,6 +10,7 @@ use sylph::{
 };
 use tokio::{
     runtime::Handle,
+    sync::watch,
     time::{Instant, MissedTickBehavior},
 };
 
@@ -155,6 +156,7 @@ impl Observation {
 /// profile of the terminal processed prefix; shutdown alone does not finalize it.
 pub struct Session {
     receiver: Receiver,
+    sample_name: Arc<str>,
     worker: Shared<BoxFuture<'static, Result<(), Arc<Error>>>>,
 }
 
@@ -187,8 +189,12 @@ impl Session {
         if refresh_interval.is_zero() || Instant::now().checked_add(refresh_interval).is_none() {
             return Err(Error::InvalidRefreshInterval);
         }
-        let sketcher =
-            ReadSketcher::new(sketch_params, "axylph".to_owned(), Some(sample_name.into()))?;
+        let sample_name = sample_name.into();
+        let sketcher = ReadSketcher::new(
+            sketch_params,
+            "axylph".to_owned(),
+            Some(sample_name.clone()),
+        )?;
         profiler.validate_sample_parameters(sketch_params.c, sketch_params.k)?;
         let runtime = Handle::try_current().map_err(|_| Error::MissingRuntime)?;
         let receiver = Receiver::new(limits, sketcher);
@@ -240,7 +246,11 @@ impl Session {
         }
         .boxed()
         .shared();
-        Ok(Self { receiver, worker })
+        Ok(Self {
+            receiver,
+            sample_name: sample_name.into(),
+            worker,
+        })
     }
 
     /// Obtain a Flight adapter sharing this session's accumulator and admission gate.
@@ -249,19 +259,25 @@ impl Session {
         self.receiver.clone()
     }
 
+    /// Serve Flight uploads and read-only server-sent observations at `GET /events`.
+    /// Each subscription starts with a complete snapshot, then receives coalesced
+    /// snapshot or status replacements. Reconnection resynchronizes without replay.
+    /// Retaining this router does not retain the session owner: dropping the owner
+    /// still requests shutdown. A client disconnect does not stop the session.
+    /// Authentication, TLS, and cross-origin access belong to the host application.
+    pub fn router(&self) -> axum::Router {
+        crate::http::router(
+            self.receiver().router(),
+            Arc::clone(&self.sample_name),
+            self.receiver.ingestion.observations.subscribe(),
+        )
+    }
+
     /// Subscribe to current state and then coalesced changes until the worker stops.
     /// The owned stream does not keep the session owner alive. Slow observers may skip
     /// intermediate states; retaining old observations retains their shared profiles.
     pub fn observe(&self) -> impl Stream<Item = Arc<Observation>> + Send + use<> {
-        let mut updates = self.receiver.ingestion.observations.subscribe();
-        async_stream::stream! {
-            loop {
-                let observation = Arc::clone(&updates.borrow_and_update());
-                let stopped = observation.state == SessionState::Stopped;
-                yield observation;
-                if stopped || updates.changed().await.is_err() { break; }
-            }
-        }
+        observations(self.receiver.ingestion.observations.subscribe())
     }
 
     /// Close admission and return a successful profile covering the terminal checkpoint.
@@ -303,6 +319,19 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.receiver.ingestion.close(CloseReason::Shutdown);
+    }
+}
+
+pub fn observations(
+    mut updates: watch::Receiver<Arc<Observation>>,
+) -> impl Stream<Item = Arc<Observation>> + Send {
+    async_stream::stream! {
+        loop {
+            let observation = Arc::clone(&updates.borrow_and_update());
+            let stopped = observation.state == SessionState::Stopped;
+            yield observation;
+            if stopped || updates.changed().await.is_err() { break; }
+        }
     }
 }
 

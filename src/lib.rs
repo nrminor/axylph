@@ -6,6 +6,7 @@
 
 mod client;
 mod error;
+mod http;
 mod protocol;
 mod receiver;
 mod session;
