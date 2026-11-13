@@ -13,7 +13,10 @@ use tokio::{
     time::{Instant, MissedTickBehavior},
 };
 
-use crate::{Error, Limits, Receiver};
+use crate::{
+    Error, Limits, Receiver,
+    receiver::{CloseReason, Ingestion},
+};
 
 /// Server-authoritative totals for a completely processed read prefix.
 /// Counts include duplicates and reads contributing no markers.
@@ -79,7 +82,7 @@ impl RefreshFailure {
     }
 }
 
-/// Lifecycle of periodic profiling. Stopping does not finalize a sample.
+/// Worker lifecycle. Finality is reported separately by [`Observation::finish_outcome`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum SessionState {
@@ -88,7 +91,7 @@ pub enum SessionState {
     Open,
     /// Admission is closed; already admitted work is draining.
     Stopping,
-    /// Admitted ingestion and periodic profiling have stopped, without finalization.
+    /// Admitted work has stopped. A recorded successful finish establishes finality.
     Stopped,
 }
 
@@ -101,6 +104,7 @@ pub struct Observation {
     pub(crate) state: SessionState,
     pub(crate) ingestion_error: Option<Arc<Error>>,
     pub(crate) refresh_error: Option<Arc<RefreshFailure>>,
+    finish_outcome: Option<Result<Arc<ProfileSnapshot>, Arc<Error>>>,
 }
 
 impl Observation {
@@ -133,13 +137,22 @@ impl Observation {
     pub const fn refresh_error(&self) -> Option<&Arc<RefreshFailure>> {
         self.refresh_error.as_ref()
     }
+
+    /// Completed finish result, retained after shutdown. `None` means no completed
+    /// finish, not a successful empty profile. Only `Some(Ok(...))` establishes finality.
+    /// An ingestion error remains independently visible, even for a final profile.
+    #[must_use]
+    pub const fn finish_outcome(&self) -> Option<&Result<Arc<ProfileSnapshot>, Arc<Error>>> {
+        self.finish_outcome.as_ref()
+    }
 }
 
 /// Owns one sample's fresh accumulator, periodic profiling, and worker lifetime.
 ///
 /// Call [`Self::shutdown`] to close admission and await admitted work. Dropping
 /// the owner requests stopping but cannot await or interrupt synchronous work.
-/// Upload EOF does not stop the session. Explicit finalization is not yet exposed.
+/// Upload EOF does not stop the session. [`Self::finish`] explicitly requests a
+/// profile of the terminal processed prefix; shutdown alone does not finalize it.
 pub struct Session {
     receiver: Receiver,
     worker: Shared<BoxFuture<'static, Result<(), Arc<Error>>>>,
@@ -181,16 +194,41 @@ impl Session {
         let receiver = Receiver::new(limits, sketcher);
         let ingestion = Arc::clone(&receiver.ingestion);
         let task = runtime.spawn(async move {
-            let result = refresh(&ingestion, profiler, refresh_interval)
+            let profiler = Arc::new(profiler);
+            let mut result = refresh(&ingestion, &profiler, refresh_interval)
                 .await
                 .map_err(Arc::new);
+            if result.is_err() {
+                ingestion.close(CloseReason::Shutdown);
+            }
+            ingestion.drain().await;
+            let finishing = *ingestion.closed.borrow() == Some(CloseReason::Finish);
+            if finishing {
+                let outcome = match &result {
+                    Ok(()) => terminal_profile(Arc::clone(&ingestion), profiler)
+                        .await
+                        .map_err(Arc::new),
+                    Err(error) => Err(Arc::clone(error)),
+                };
+                if let Err(error) = &outcome
+                    && !matches!(error.as_ref(), Error::Profile(_))
+                {
+                    result = Err(Arc::clone(error));
+                }
+                ingestion.observations.send_modify(|observation| {
+                    let observation = Arc::make_mut(observation);
+                    if let Ok(snapshot) = &outcome {
+                        observation.snapshot = Some(Arc::clone(snapshot));
+                        observation.refresh_error = None;
+                    }
+                    observation.finish_outcome = Some(outcome);
+                });
+            }
             if let Err(error) = &result {
-                ingestion.close();
                 ingestion.observations.send_modify(|observation| {
                     Arc::make_mut(observation).ingestion_error = Some(Arc::clone(error));
                 });
             }
-            ingestion.drain().await;
             ingestion.observations.send_modify(|observation| {
                 Arc::make_mut(observation).state = SessionState::Stopped;
             });
@@ -226,21 +264,45 @@ impl Session {
         }
     }
 
-    /// Close admission, stop periodic scheduling, and await admitted work without finalizing.
+    /// Close admission and return a successful profile covering the terminal checkpoint.
+    /// Reuses an exact successful snapshot or performs one required terminal calculation.
+    /// Repeated calls observe the same outcome, including failure; they do not retry.
+    /// Cancelling the wait does not cancel an accepted finish request.
+    ///
+    /// # Errors
+    /// Rejects finish after shutdown won admission closure. A failed calculation leaves
+    /// admission closed, preserves any older profile as non-final, and records the failure.
+    pub async fn finish(&self) -> Result<Arc<ProfileSnapshot>, Arc<Error>> {
+        if self.receiver.ingestion.close(CloseReason::Finish) != CloseReason::Finish {
+            return Err(Arc::new(Error::SessionClosed));
+        }
+        self.worker.clone().await?;
+        self.receiver
+            .ingestion
+            .observations
+            .borrow()
+            .finish_outcome
+            .clone()
+            .ok_or_else(|| Arc::new(Error::SessionClosed))?
+    }
+
+    /// Close admission, stop periodic scheduling, and await admitted work.
     /// Does not wait for client EOF. Repeated/concurrent calls await the same worker.
     /// Cancelling this wait does not cancel draining or lose ownership of the worker.
+    /// Does not request finalization, but honors an already accepted finish request.
+    /// Scientific finish failures remain available through [`Observation::finish_outcome`].
     ///
     /// # Errors
     /// Returns a shared task/state failure if the worker could not complete normally.
     pub async fn shutdown(&self) -> Result<(), Arc<Error>> {
-        self.receiver.ingestion.close();
+        self.receiver.ingestion.close(CloseReason::Shutdown);
         self.worker.clone().await
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        self.receiver.ingestion.close();
+        self.receiver.ingestion.close(CloseReason::Shutdown);
     }
 }
 
@@ -302,17 +364,16 @@ impl SessionBuilder {
 }
 
 async fn refresh(
-    ingestion: &Arc<crate::receiver::Ingestion>,
-    profiler: Profiler,
+    ingestion: &Arc<Ingestion>,
+    profiler: &Arc<Profiler>,
     interval: Duration,
 ) -> Result<(), Error> {
-    let profiler = Arc::new(profiler);
     let mut closed = ingestion.closed.subscribe();
     let mut timer = tokio::time::interval(interval);
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut attempted = ProcessedCheckpoint::default();
     loop {
-        if *closed.borrow() {
+        if closed.borrow().is_some() {
             break;
         }
         tokio::select! {
@@ -321,7 +382,7 @@ async fn refresh(
             _ = timer.tick() => {}
         }
         let input = Arc::clone(ingestion);
-        let profiler = Arc::clone(&profiler);
+        let profiler = Arc::clone(profiler);
         let calculated = tokio::task::spawn_blocking(move || {
             let Some((sketch, checkpoint)) = input.capture(attempted)? else {
                 return Ok(None);
@@ -352,4 +413,27 @@ async fn refresh(
         });
     }
     Ok(())
+}
+
+async fn terminal_profile(
+    ingestion: Arc<Ingestion>,
+    profiler: Arc<Profiler>,
+) -> Result<Arc<ProfileSnapshot>, Error> {
+    tokio::task::spawn_blocking(move || {
+        // Admission is closed and admitted ingestion has drained. Check the
+        // scientific state even when a published result appears reusable.
+        let checkpoint = ingestion.checkpoint()?;
+        let snapshot = ingestion.observations.borrow().snapshot.clone();
+        if let Some(snapshot) = snapshot.filter(|snapshot| snapshot.checkpoint == checkpoint) {
+            return Ok(snapshot);
+        }
+        let (sketch, checkpoint) = ingestion.capture_terminal()?;
+        let profile = profiler.profile(&sketch)?;
+        Ok(Arc::new(ProfileSnapshot {
+            checkpoint,
+            profile,
+        }))
+    })
+    .await
+    .map_err(Error::SessionTask)?
 }

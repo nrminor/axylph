@@ -25,7 +25,7 @@ axylph send reads.fastq.gz
 
 The receiver listens at `127.0.0.1:50051` by default. Use `serve --listen HOST:PORT` and `send FILE --server http://HOST:PORT` to select another address. There is no authentication or TLS. Use a trusted local network; do not expose this prototype to the public internet.
 
-Every upload to this receiver belongs to the same sample. `serve` requires `--sample`; `--c` defaults to 200, `--k` to 31, and exact single-end deduplication is enabled unless `--no-dedup` is supplied. Only positive c and k=21/31 are supported. These settings remain fixed until a new receiver is started. There is no sample routing or explicit session-finalization operation yet.
+Every upload to this receiver belongs to the same sample. `serve` requires `--sample`; `--c` defaults to 200, `--k` to 31, and exact single-end deduplication is enabled unless `--no-dedup` is supplied. Only positive c and k=21/31 are supported. These settings remain fixed until a new receiver is started. The CLI has no sample routing or explicit session-finalization operation yet.
 
 Progress counts start at zero for each upload. A batch receipt follows validation and sketch accumulation; it does not promise a profile or durable storage. A completion report requires a clean input end, successful local parsing, a successful RPC, and matching client/server totals. Completion ends the upload, not the sample. There is no rollback or automatic retry.
 
@@ -78,6 +78,8 @@ let session = Session::builder("sample-1", profiler)
 let app = session.receiver().router();
 let observations = session.observe();
 // Serve app and consume observations on your runtime.
+// When the operator explicitly finishes the sample:
+let final_snapshot = session.finish().await?;
 session.shutdown().await?;
 ```
 
@@ -87,7 +89,9 @@ The builder defaults to sylph's `SketchParams::default()` (c=200, k=31, exact de
 
 One worker captures a copy of cumulative marker counts and metadata with its checkpoint, then profiles outside the ingestion lock using resident references. It does not copy raw reads, reference genomes, or duplicate history, nor pre-copy pending inputs. An ordinary refresh error preserves the previous snapshot and reports the attempted checkpoint; another automatic attempt requires newer evidence. Before the first success, no profile is available. Refresh eligibility is not a calculation deadline, and large-reference memory use, copy pauses, and sustained throughput have not been characterized.
 
-`shutdown()` closes read admission, stops periodic scheduling, drains admitted blocking work, and awaits active profiling without waiting for upload EOF. Repeated or cancelled waits do not restart or cancel that work. Dropping the owner requests stopping but cannot await synchronous work. Shutdown does not finalize the sample or guarantee a profile covering the last read. Explicit `finish()` is not implemented in this slice. Library consumers own their runtime and choose the profiler's worker count; neither count is a whole-process CPU quota.
+`finish()` closes read admission and drains admitted work, then returns a shared profile covering exactly the terminal processed checkpoint. An existing successful snapshot with that coverage is reused; otherwise one required terminal calculation runs. `Observation::finish_outcome()` retains the success or failure after shutdown. Finality belongs to this recorded outcome, not a mutable flag on previously published snapshots. A failed finish keeps admission closed and older results non-final; repeated calls observe the same outcome without retrying. Ingestion errors remain independently visible and a final profile does not prove a successful upload.
+
+`shutdown()` closes read admission, stops periodic scheduling, drains admitted blocking work, and awaits active profiling without waiting for upload EOF. Repeated or cancelled waits do not restart or cancel that work. Dropping the owner requests stopping but cannot await synchronous work. The first terminal request wins: shutdown honors an already accepted finish, but finish after shutdown cannot restart the session. Shutdown alone does not finalize the sample or guarantee a profile covering the last read. Library consumers own their runtime and choose the profiler's worker count; neither count is a whole-process CPU quota.
 
 ## Development
 
@@ -100,11 +104,11 @@ mise run check
 mise run ci-validate
 ```
 
-`check` runs formatting, Clippy, nextest, documentation checks, and doctests when `src/lib.rs` exists. Tests exercise the client/server interface and public Flight input handling. Accumulation and profile-publication tests use checked-in expectations generated from unchanged upstream revision `1f7fcb53aa20b592d8b3b97f75d9971a60eb06e9`; they do not run the adapted code to generate their oracle. The JSON fixtures record provenance, checksums, and generation environment. The publication tracer covers 23 synthetic reads and their cumulative profile at CLI precision, not unrounded equivalence, overlapping computation/ingestion, or large-workload performance. Build and verification tasks use `Cargo.lock` without updating dependencies.
+`check` runs formatting, Clippy, nextest, documentation checks, and doctests when `src/lib.rs` exists. Tests exercise the client/server interface and public Flight input handling. Accumulation, profile-publication, and finish tests use checked-in expectations generated from unchanged upstream revision `1f7fcb53aa20b592d8b3b97f75d9971a60eb06e9`; they do not run the adapted code to generate their oracle. The JSON fixtures record provenance, checksums, and generation environment. The profiling tracers cover 23 synthetic reads and their cumulative profile at CLI precision, including successful finality retained after shutdown. They do not establish unrounded equivalence, overlapping computation/ingestion, lifecycle-race behavior, or large-workload performance. Build and verification tasks use `Cargo.lock` without updating dependencies.
 
 `.gitignore` denies files by default. Add each source, test, or configuration file to its allowlist when it should be tracked. Keep imports from the same root in one `use` statement.
 
-Library errors use `axylph::Error`, defined with `thiserror` in `src/error.rs`; session shutdown shares its outcome through `Arc<Error>` so repeated callers observe the same failure. Application failures have named variants; dependency failures wrap their source errors. The CLI installs `color-eyre` for reporting and adds file or address context. Library callers do not need to install a reporting handler.
+Library errors use `axylph::Error`, defined with `thiserror` in `src/error.rs`; session finish and shutdown share errors through `Arc<Error>` so repeated callers can observe the same failure. Application failures have named variants; dependency failures wrap their source errors. The CLI installs `color-eyre` for reporting and adds file or address context. Library callers do not need to install a reporting handler.
 
 Dependencies serve specific roles: Arrow and Flight handle structured reads and IPC, Tonic and Axum serve HTTP/2, and Tokio plus stream adapters provide bounded asynchronous transfer. `seq_io` bounds FASTQ parsing; `flate2` handles gzip, including concatenated members, with its Rust backend. Serde and JSON encode the progress wire format. Clap handles CLI parsing and help. Sylph owns the scientific algorithm, sketch types, and public profile representation; only its embeddable profiling capability is enabled, not CLI, file readers, or native compression. Replacing these libraries means taking on their behavior and maintenance, not just removing package names. Optional tracing-span capture in `color-eyre` is disabled because the application does not set up tracing spans.
 

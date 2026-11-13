@@ -1,4 +1,4 @@
-//! Real Flight input and periodically published profiles against an independent oracle.
+//! Real Flight input and periodic and terminal profiles against an independent oracle.
 //!
 //! `default.json` is a lossless YAML-to-JSON conversion of the sylph fork's pinned
 //! `default.yaml` (SHA-256 8af09a9fbabe124676d25ae9d00a24e0e59bde756b28d16ab506b37617fef966).
@@ -109,7 +109,7 @@ async fn publishes_an_independently_verified_complete_read_prefix() {
     .await;
     if cleanup.is_err() {
         server.abort();
-        let _ = server.await;
+        let _ = timeout(Duration::from_secs(10), server).await;
     }
     let (drained, transport_result) = cleanup.expect("session and server must drain");
     drained.unwrap();
@@ -125,6 +125,101 @@ async fn publishes_an_independently_verified_complete_read_prefix() {
     assert_eq!(snapshot.checkpoint().bases(), 11_730);
     assert_eq!(observation.processed(), snapshot.checkpoint());
     assert_profile(snapshot.profile(), expected);
+}
+
+#[tokio::test]
+async fn finish_returns_an_independent_terminal_profile_and_retains_finality_after_shutdown() {
+    let fixture: Fixture =
+        serde_json::from_str(include_str!("fixtures/profile/default.json")).unwrap();
+    assert_eq!(fixture.revision, "1f7fcb53aa20b592d8b3b97f75d9971a60eb06e9");
+    let expected = fixture
+        .prefixes
+        .iter()
+        .find(|prefix| prefix.end == 23)
+        .unwrap();
+    let mut input = String::new();
+    for (i, read) in fixture.reads.iter().take(23).enumerate() {
+        writeln!(
+            &mut input,
+            "@read-{i}\n{read}\n+\n{}",
+            "I".repeat(read.len())
+        )
+        .unwrap();
+    }
+    let database =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/profile/reference.syldb");
+    let profiler = Profiler::open_syldb(database, ProfileOptions::default(), 1).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let session = Session::builder("synthetic-sample", profiler)
+        .c(fixture.c)
+        .k(fixture.k)
+        .deduplication(if fixture.no_dedup {
+            Deduplication::Disabled
+        } else {
+            Deduplication::Exact
+        })
+        .start()
+        .unwrap();
+    let router = session.receiver().router();
+    let (stop, stopped) = oneshot::channel();
+    let mut server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    let outcome = AssertUnwindSafe(timeout(Duration::from_secs(20), async {
+        let receipt = Client::new(format!("http://{address}"), Limits::default())
+            .send(Cursor::new(input.into_bytes()), |_| {})
+            .await
+            .unwrap();
+        assert!(receipt.complete);
+        // Do not wait for periodic publication: finish must provide the terminal result.
+        let snapshot = session.finish().await.unwrap();
+        let observation = Box::pin(session.observe()).next().await.unwrap();
+        (snapshot, observation)
+    }))
+    .catch_unwind()
+    .await;
+    let cleanup = timeout(Duration::from_secs(10), async {
+        let drained = session.shutdown().await;
+        let _ = stop.send(());
+        let transport_result = (&mut server).await;
+        (drained, transport_result)
+    })
+    .await;
+    if cleanup.is_err() {
+        server.abort();
+        let _ = timeout(Duration::from_secs(10), server).await;
+    }
+    let (drained, transport_result) = cleanup.expect("session and server must drain");
+    drained.unwrap();
+    transport_result.unwrap().unwrap();
+    let (snapshot, observation) = match outcome {
+        Ok(result) => result.unwrap(),
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    assert_eq!(snapshot.checkpoint().reads(), 23);
+    assert_eq!(snapshot.checkpoint().bases(), 11_730);
+    assert_profile(snapshot.profile(), expected);
+
+    let after_shutdown = timeout(Duration::from_secs(10), Box::pin(session.observe()).next())
+        .await
+        .expect("a fresh observer must receive retained finality after shutdown")
+        .unwrap();
+    for observation in [&observation, &after_shutdown] {
+        assert_eq!(observation.processed(), snapshot.checkpoint());
+        let terminal = observation
+            .finish_outcome()
+            .expect("successful finish must be recorded")
+            .as_ref()
+            .expect("recorded finish must be successful");
+        assert_eq!(terminal.checkpoint().reads(), 23);
+        assert_eq!(terminal.checkpoint().bases(), 11_730);
+        assert_profile(terminal.profile(), expected);
+    }
 }
 
 #[track_caller]

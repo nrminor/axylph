@@ -84,6 +84,9 @@ pub enum Error {
     /// Starting a session requires a running Tokio runtime.
     #[error("session startup requires a Tokio runtime")]
     MissingRuntime,
+    /// Shutdown closed the session without requesting a final result.
+    #[error("session was shut down without a finish outcome")]
+    SessionClosed,
     /// Scientific sketch configuration or accumulation failed.
     #[error(transparent)]
     Sketch(#[from] SketchError),

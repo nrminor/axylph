@@ -41,8 +41,14 @@ pub struct Ingestion {
     // Held before submission and throughout each blocking ingestion job, even
     // if the response future is dropped. This lets shutdown drain admitted work.
     work: Arc<AsyncMutex<()>>,
-    pub(crate) closed: watch::Sender<bool>,
+    pub(crate) closed: watch::Sender<Option<CloseReason>>,
     pub(crate) observations: watch::Sender<Arc<Observation>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CloseReason {
+    Finish,
+    Shutdown,
 }
 
 struct SketchState {
@@ -53,20 +59,28 @@ struct SketchState {
 
 impl Ingestion {
     fn check_open(&self) -> Result<(), Status> {
-        if *self.closed.borrow() {
+        if self.closed.borrow().is_some() {
             return Err(Status::unavailable("session read admission is closed"));
         }
         Ok(())
     }
 
-    pub(crate) fn close(&self) {
-        self.closed.send_replace(true);
-        self.observations.send_modify(|observation| {
-            let observation = Arc::make_mut(observation);
-            if observation.state == SessionState::Open {
-                observation.state = SessionState::Stopping;
+    pub(crate) fn close(&self, reason: CloseReason) -> CloseReason {
+        let mut selected = reason;
+        // The first request closes admission and fixes the terminal intent before
+        // notifying the worker. Shutdown cannot downgrade an accepted finish.
+        self.closed.send_if_modified(|closed| {
+            if let Some(previous) = *closed {
+                selected = previous;
+                return false;
             }
+            *closed = Some(reason);
+            self.observations.send_modify(|observation| {
+                Arc::make_mut(observation).state = SessionState::Stopping;
+            });
+            true
         });
+        selected
     }
 
     pub(crate) async fn drain(&self) {
@@ -78,12 +92,24 @@ impl Ingestion {
         after: ProcessedCheckpoint,
     ) -> Result<Option<(SequencesSketch, ProcessedCheckpoint)>, Error> {
         let state = self.state.lock().map_err(|_| Error::SketchPoisoned)?;
-        if *self.closed.borrow() || state.processed.reads <= after.reads {
+        if self.closed.borrow().is_some() || state.processed.reads <= after.reads {
             return Ok(None);
         }
         // Clone the actual map, not a rebuilt/sorted collection: scientific
         // inference may depend on its iteration order. No duplicate history is copied.
         Ok(Some((state.sketcher.sketch().clone(), state.processed)))
+    }
+
+    pub(crate) fn checkpoint(&self) -> Result<ProcessedCheckpoint, Error> {
+        let state = self.state.lock().map_err(|_| Error::SketchPoisoned)?;
+        Ok(state.processed)
+    }
+
+    // The session calls this only after closing admission and draining its work.
+    // Unlike periodic capture, an empty terminal sample also needs a result.
+    pub(crate) fn capture_terminal(&self) -> Result<(SequencesSketch, ProcessedCheckpoint), Error> {
+        let state = self.state.lock().map_err(|_| Error::SketchPoisoned)?;
+        Ok((state.sketcher.sketch().clone(), state.processed))
     }
 
     fn extend(&self, sequences: &BinaryArray) -> Result<(), Status> {
@@ -188,7 +214,7 @@ impl Receiver {
                     failure: None,
                 }),
                 work: Arc::new(AsyncMutex::new(())),
-                closed: watch::channel(false).0,
+                closed: watch::channel(None).0,
                 observations: watch::channel(Arc::new(Observation::default())).0,
             }),
         }
