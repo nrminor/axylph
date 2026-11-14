@@ -60,6 +60,20 @@ struct ServeArgs {
     no_dedup: bool,
 }
 
+impl ServeArgs {
+    const fn supplied(&self) -> bool {
+        self.sample.is_some()
+            || self.listen.is_some()
+            || self.c.is_some()
+            || self.k.is_some()
+            || self.dedup
+            || self.no_dedup
+            || self.reference.is_some()
+            || self.profile_workers.is_some()
+            || self.refresh_interval_ms.is_some()
+    }
+}
+
 #[derive(Subcommand)]
 enum CliCommand {
     /// Accumulate one sample on a trusted network. No authentication or TLS.
@@ -69,6 +83,12 @@ enum CliCommand {
         /// Path to a four-line-per-read FASTQ file, optionally gzip compressed.
         path: PathBuf,
         /// HTTP address of the Flight service.
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Finish ingestion and print the final profile as JSON.
+    Finish {
+        /// HTTP origin of the service.
         #[arg(long)]
         server: Option<String>,
     },
@@ -92,6 +112,9 @@ struct FileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "FileSend")]
     send: Option<FileSend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "FileSend")]
+    finish: Option<FileSend>,
 }
 
 #[derive(Default, Deserialize, JsonSchema)]
@@ -144,6 +167,9 @@ pub enum Command {
     },
     Send {
         path: PathBuf,
+        server: String,
+    },
+    Finish {
         server: String,
     },
     Schema,
@@ -267,6 +293,22 @@ pub fn parse() -> Result<Resolved> {
         });
     }
     let (file, config_path) = load(cli.config)?;
+    if let Some(CliCommand::Finish { server }) = cli.command {
+        if cli.batch_bytes.is_some() || cli.batch_reads.is_some() || cli.serve.supplied() {
+            bail!("serve and batch options cannot be used with finish");
+        }
+        return Ok(Resolved {
+            command: Command::Finish {
+                server: resolve(
+                    server,
+                    "AXYLPH_SERVER",
+                    file.finish.unwrap_or_default().server,
+                    "http://127.0.0.1:50051".to_owned(),
+                )?,
+            },
+            limits: Limits::default(),
+        });
+    }
     let limits = Limits::new(
         resolve(
             cli.batch_bytes,
@@ -283,16 +325,7 @@ pub fn parse() -> Result<Resolved> {
     )?;
     let command = match cli.command {
         Some(CliCommand::Send { path, server }) => {
-            if cli.serve.sample.is_some()
-                || cli.serve.listen.is_some()
-                || cli.serve.c.is_some()
-                || cli.serve.k.is_some()
-                || cli.serve.dedup
-                || cli.serve.no_dedup
-                || cli.serve.reference.is_some()
-                || cli.serve.profile_workers.is_some()
-                || cli.serve.refresh_interval_ms.is_some()
-            {
+            if cli.serve.supplied() {
                 bail!("serve options cannot be used with send");
             }
             Command::Send {
@@ -306,6 +339,7 @@ pub fn parse() -> Result<Resolved> {
             }
         }
         Some(CliCommand::Schema) => Command::Schema,
+        Some(CliCommand::Finish { .. }) => bail!("finish was already resolved"),
         Some(CliCommand::Serve) | None => {
             let serve = file.serve.unwrap_or_default();
             let (reference, profile_workers, refresh_interval_ms) =

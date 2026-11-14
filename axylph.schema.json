@@ -13,6 +13,9 @@
       "format": "uint",
       "minimum": 0
     },
+    "finish": {
+      "$ref": "#/definitions/FileSend"
+    },
     "send": {
       "$ref": "#/definitions/FileSend"
     },

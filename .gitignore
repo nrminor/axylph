@@ -22,6 +22,7 @@
 !/src/client.rs
 !/src/config.rs
 !/src/error.rs
+!/src/finish.rs
 !/src/http.rs
 !/src/lib.rs
 !/src/main.rs
@@ -36,6 +37,7 @@
 !/tests/profiling.rs
 !/tests/support/
 !/tests/support/profile_oracle.rs
+!/tests/support/finish_tests.rs
 !/tests/fixtures/
 !/tests/fixtures/read-sketch.json
 !/tests/fixtures/profile/

@@ -14,7 +14,7 @@ FASTQ file → client → Arrow Flight → receiver → cumulative sketch
 Install from the checkout with `cargo install --locked --path .` and ensure `~/.cargo/bin` is on your `PATH`. Then start the receiver from any directory:
 
 ```sh
-axylph serve --sample sample-1
+axylph serve --sample sample-1 --reference reference.syldb
 ```
 
 In another terminal, send a file:
@@ -23,9 +23,15 @@ In another terminal, send a file:
 axylph send reads.fastq.gz
 ```
 
-The receiver listens at `127.0.0.1:50051` by default. Use `serve --listen HOST:PORT` and `send FILE --server http://HOST:PORT` to select another address. There is no authentication or TLS. Use a trusted local network; do not expose this prototype to the public internet.
+After sending all batches, explicitly finalize the sample and save its result:
 
-Every upload to this receiver belongs to the same sample. Without a sample from `--sample`, the environment, or configuration, `serve` generates a name for the run and prints it at startup. `--c` defaults to 200, `--k` to 31, and exact single-end deduplication is enabled by default. Only positive c and k=21/31 are supported. These settings remain fixed until a new receiver is started. There is no sample routing. A profiled receiver supports explicit finalization over HTTP, but a separate `axylph finish` subcommand and a HUD are not implemented.
+```sh
+axylph finish --server http://127.0.0.1:50051 > result.json
+```
+
+Then separately stop the receiver, for example with Ctrl-C. Finish does not shut it down. The receiver listens at `127.0.0.1:50051` by default. Use `serve --listen HOST:PORT` and `send FILE --server http://HOST:PORT` to select another address. There is no authentication or TLS. Use a trusted local network; do not expose this prototype to the public internet.
+
+Every upload to this receiver belongs to the same sample. Without a sample from `--sample`, the environment, or configuration, `serve` generates a name for the run and prints it at startup. `--c` defaults to 200, `--k` to 31, and exact single-end deduplication is enabled by default. Only positive c and k=21/31 are supported. These settings remain fixed until a new receiver is started. There is no sample routing. Finish requires a profiled receiver; a HUD is not implemented.
 
 To enable profiles, supply an existing sylph reference database with `serve --reference PATH` (or the configuration sources below). The reference must be compatible with the selected sketch parameters: startup rejects incompatibility before binding the listener, rather than changing scientific defaults. For example, a c=50 or c=100 reference requires an explicit matching `--c`. Profiled startup reports the resolved reference path and profiling settings with the sample summary. Profiling uses sylph's `ProfileOptions::default()`.
 
@@ -51,6 +57,9 @@ dedup = true
 
 [send]
 server = "http://127.0.0.1:50051"
+
+[finish]
+server = "http://127.0.0.1:50051"
 ```
 
 The schema path is relative to the TOML file. Profiling is selected with `--reference`, `AXYLPH_REFERENCE`, or `[serve] reference`. A relative reference path from TOML is relative to the selected configuration file's directory; a relative CLI or environment path is relative to the current working directory. Without a reference, the receiver is sketch-only and explicitly setting profiling tuning options is an error.
@@ -59,13 +68,13 @@ The schema path is relative to the TOML file. Profiling is selected with `--refe
 
 The other environment variables are `AXYLPH_BATCH_BYTES`, `AXYLPH_BATCH_READS`, `AXYLPH_SAMPLE`, `AXYLPH_LISTEN`, `AXYLPH_C`, `AXYLPH_K`, `AXYLPH_DEDUP`, and `AXYLPH_SERVER`; `AXYLPH_CONFIG` selects the file. Boolean `AXYLPH_DEDUP` accepts `true` or `false`; CLI flags `--dedup` and `--no-dedup` explicitly enable or disable it and conflict with each other.
 
-Bare `axylph` runs `serve`; `axylph send FILE` uses `[send]`. Shared limits and the active command's values are resolved and validated; inactive command settings are not semantically validated, although the whole file must parse with known keys and correct TOML types. Serve-only CLI options cannot be used with `send`. The JSON Schema checks structure and types, not all runtime constraints; runtime validation is authoritative. Regenerate it with `mise run schema` and check it with `mise run schema-check` (also included in `mise run check`). `axylph schema` prints the schema without loading configuration.
+Bare `axylph` runs `serve`; `axylph send FILE` uses `[send]`. Finish resolves its server independently from `[finish] server`, `AXYLPH_SERVER`, or `--server`, with the usual precedence and default `http://127.0.0.1:50051`; it does not use `[send] server`. Finish needs no sample, reference, or batch settings and rejects explicit serve or batch CLI options. Shared limits and the active command's values are resolved and validated where applicable; inactive command settings are not semantically validated, although the whole file must parse with known keys and correct TOML types. Serve-only CLI options cannot be used with `send`. The JSON Schema checks structure and types, not all runtime constraints; runtime validation is authoritative. Regenerate it with `mise run schema` and check it with `mise run schema-check` (also included in `mise run check`). `axylph schema` prints the schema without loading configuration.
 
 ## Input and limits
 
 The client accepts four-line FASTQ records and detects gzip from the file contents. Concatenated gzip members are supported. It preserves the header, sequence letter case, and Phred+33 quality bytes. Sequence symbols must be IUPAC nucleotide letters; quality values must be printable bytes with one value per base. FASTA and wrapped FASTQ are not client inputs in this prototype.
 
-Both commands accept `--batch-bytes` and `--batch-reads`. Defaults are 1 MiB of identifier/sequence/quality data and 1,024 reads per batch. The supported maxima are 1 MiB and 16,384 reads. One read must fit in a batch. Set the client limits no higher than the receiver limits. There is no total upload size limit.
+Serve and send accept `--batch-bytes` and `--batch-reads`. Defaults are 1 MiB of identifier/sequence/quality data and 1,024 reads per batch. The supported maxima are 1 MiB and 16,384 reads. One read must fit in a batch. Set the client limits no higher than the receiver limits. There is no total upload size limit.
 
 The client has a one-batch channel and a parser buffer capped at 2 MiB with the default settings. The receiver decodes one batch at a time and permits one active upload. Flight messages are limited to 4 MiB. These are component limits, not a bound on total process memory: Arrow encoding, HTTP/2, and the runtime also use buffers. Marker counts and duplicate history grow with the sample; there is no total sketch-memory limit yet. Validation and sketching run on blocking threads, borrowing sequences from Arrow buffers without creating per-read copies.
 
@@ -132,6 +141,8 @@ Periodic eligibility is checked before submitting a capture. Each attempt anchor
 `shutdown()` closes read admission, stops periodic scheduling, drains admitted blocking work, and awaits active profiling without waiting for upload EOF. Repeated or cancelled waits do not restart or cancel that work. Dropping the owner requests stopping but cannot await synchronous work. The first terminal request wins: shutdown honors an already accepted finish, but finish after shutdown cannot restart the session. Shutdown alone does not finalize the sample or guarantee a profile covering the last read. Library consumers own their runtime and choose the profiler's worker count; neither count is a whole-process CPU quota.
 
 ## HTTP observations and finish
+
+`axylph finish` accepts an HTTP origin only: no TLS, proxy path, credentials, query, or fragment. It waits for the retained outcome without retrying or imposing a short timeout. It buffers and validates the response before writing to stdout, with a 64 MiB response limit. On success it writes the raw JSON (preserving its values); if the result contains an ingestion error, it still writes the JSON, warns on stderr, and exits nonzero. Other errors produce no JSON on stdout.
 
 `Session::router()` serves Flight over HTTP/2, read-only `GET /events`, and `POST /finish` on the same listener, with HTTP/1.1 or HTTP/2 for the latter routes. The CLI exposes these routes when a reference is configured; `Receiver::router()` and the sketch-only CLI remain Flight-only. Library applications must retain their `Session` owner while serving: retaining a router does not keep the worker owner alive, and an SSE disconnect does not stop profiling.
 

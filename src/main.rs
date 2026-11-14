@@ -1,16 +1,17 @@
 //! Command-line interface for read transfer and cumulative sketching.
 
 mod config;
+mod finish;
 mod server;
 
-use std::fs::File;
+use std::{fs::File, process::ExitCode};
 
 use axylph::Client;
 use color_eyre::eyre::WrapErr;
 use config::Command;
 use sylph::read_sketch::{Deduplication, SketchParams};
 
-fn main() -> color_eyre::Result<()> {
+fn main() -> color_eyre::Result<ExitCode> {
     color_eyre::install()?;
     let cli = config::parse()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -22,10 +23,11 @@ fn main() -> color_eyre::Result<()> {
     result
 }
 
-async fn run(cli: config::Resolved) -> color_eyre::Result<()> {
+async fn run(cli: config::Resolved) -> color_eyre::Result<ExitCode> {
     let limits = cli.limits;
     match cli.command {
         Command::Schema => config::print_schema()?,
+        Command::Finish { server } => return finish::run(&server).await,
         Command::Serve {
             listen,
             sample,
@@ -75,5 +77,5 @@ async fn run(cli: config::Resolved) -> color_eyre::Result<()> {
                 .wrap_err_with(|| format!("could not transfer {}", path.display()))?;
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }

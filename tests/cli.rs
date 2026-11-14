@@ -29,6 +29,9 @@ use tokio::{
 #[path = "support/profile_oracle.rs"]
 mod profile_oracle;
 
+#[path = "support/finish_tests.rs"]
+mod finish_tests;
+
 use profile_oracle::{Fixture, Prefix, assert_wire_profile};
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -608,6 +611,15 @@ async fn profile_endpoint(stderr: ChildStderr) -> Result<SocketAddr> {
     bail!("server closed stderr or exceeded 16 KiB before startup; stderr:\n{diagnostics}")
 }
 
+fn reference_fixture_config(directory: &Path) -> Result<PathBuf> {
+    let config = reference_config(directory, "reference.syldb")?;
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/profile/reference.syldb"),
+        directory.join("config/reference.syldb"),
+    )?;
+    Ok(config)
+}
+
 async fn finish_binary(address: SocketAddr) -> Result<Value> {
     // Drive the connection inline: cancellation drops both halves, without a detached task.
     let stream = TcpStream::connect(address).await?;
@@ -648,7 +660,32 @@ async fn finish_binary(address: SocketAddr) -> Result<Value> {
     Ok(snapshot)
 }
 
-async fn verify_binary_profile(address: SocketAddr) -> Result<()> {
+enum FinishRequest<'a> {
+    Http,
+    Command(&'a Path),
+}
+
+impl FinishRequest<'_> {
+    async fn snapshot(&self, address: SocketAddr) -> Result<Value> {
+        match self {
+            Self::Http => finish_binary(address).await,
+            Self::Command(directory) => {
+                let endpoint = format!("http://{address}");
+                let result = output(directory, &["finish", "--server", &endpoint], &[]).await?;
+                ensure!(
+                    result.status.code() == Some(0),
+                    "finish CLI must exit zero; status: {}, stderr: {}",
+                    result.status,
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                serde_json::from_slice(&result.stdout)
+                    .wrap_err("finish CLI stdout must contain the complete JSON snapshot")
+            }
+        }
+    }
+}
+
+async fn verify_binary_profile(address: SocketAddr, finish: FinishRequest<'_>) -> Result<()> {
     let fixture: Fixture = serde_json::from_str(include_str!("fixtures/profile/default.json"))?;
     ensure!(
         fixture.revision == "1f7fcb53aa20b592d8b3b97f75d9971a60eb06e9"
@@ -683,7 +720,7 @@ async fn verify_binary_profile(address: SocketAddr) -> Result<()> {
             },
         "unexpected Flight receipt: {receipt:?}"
     );
-    let snapshot = finish_binary(address).await?;
+    let snapshot = finish.snapshot(address).await?;
     let checkpoint = json!({"reads": "23", "bases": "11730"});
     ensure!(
         snapshot.get("status")
@@ -706,13 +743,21 @@ async fn verify_binary_profile(address: SocketAddr) -> Result<()> {
     catch_unwind(|| assert_wire_profile(profile, expected))
         .map_err(|_| eyre!("independent wire profile oracle panicked"))?;
     ensure!(
+        finish.snapshot(address).await? == snapshot,
+        "a fresh finish client must retain the terminal result"
+    );
+    ensure!(
         finish_binary(address).await? == snapshot,
-        "a fresh connection must retain the terminal result after finish"
+        "the server must remain available with the same terminal snapshot"
     );
     Ok(())
 }
 
-async fn run_reference_binary(directory: &Path, config: &Path) -> Result<()> {
+async fn run_reference_binary(
+    directory: &Path,
+    config: &Path,
+    finish: FinishRequest<'_>,
+) -> Result<()> {
     let config_argument = config
         .to_str()
         .ok_or_else(|| eyre!("non-UTF-8 config path"))?;
@@ -727,9 +772,12 @@ async fn run_reference_binary(directory: &Path, config: &Path) -> Result<()> {
         let address = timeout(DEADLINE, profile_endpoint(stderr))
             .await
             .wrap_err("profile binary must announce startup within five seconds")??;
-        timeout(Duration::from_secs(20), verify_binary_profile(address))
-            .await
-            .wrap_err("Flight upload and HTTP finish must complete within 20 seconds")?
+        timeout(
+            Duration::from_secs(20),
+            verify_binary_profile(address, finish),
+        )
+        .await
+        .wrap_err("Flight upload and finish must complete within 20 seconds")?
     }
     .await;
     let cleanup = timeout(DEADLINE, child.kill())
@@ -744,17 +792,36 @@ async fn configured_binary_resolves_reference_relative_to_config_and_serves_term
 -> Result<()> {
     let directory = test_directory()?;
     let outcome = async {
-        let config = reference_config(&directory, "reference.syldb")?;
-        fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/profile/reference.syldb"),
-            directory.join("config/reference.syldb"),
-        )?;
-        run_reference_binary(&directory, &config).await
+        let config = reference_fixture_config(&directory)?;
+        run_reference_binary(&directory, &config, FinishRequest::Http).await
     }
     .await;
     preserve_failure(
         outcome,
         fs::remove_dir_all(&directory).wrap_err("remove reference CLI fixtures"),
+    )
+}
+
+#[tokio::test]
+async fn finish_command_without_sample_prints_terminal_profile_and_repeats_from_fresh_process()
+-> Result<()> {
+    let directory = test_directory()?;
+    let outcome = async {
+        let config = reference_fixture_config(&directory)?;
+        // Neither the server's selected config nor a sample is passed to the finish client.
+        let client_directory = directory.join("client");
+        fs::create_dir(&client_directory)?;
+        run_reference_binary(
+            &directory,
+            &config,
+            FinishRequest::Command(&client_directory),
+        )
+        .await
+    }
+    .await;
+    preserve_failure(
+        outcome,
+        fs::remove_dir_all(&directory).wrap_err("remove finish CLI fixtures"),
     )
 }
 
