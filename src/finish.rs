@@ -94,20 +94,22 @@ fn validate(body: &[u8]) -> Result<Option<Failure>> {
     Ok(snapshot.status.ingestion_error)
 }
 
-fn output(body: &[u8]) -> Result<ExitCode> {
+fn output(body: &[u8], display: &crate::display::Display) -> Result<ExitCode> {
     let failure = validate(body)?;
-    let stdout = std::io::stdout();
-    let mut output = stdout.lock();
-    output.write_all(body)?;
-    if !body.ends_with(b"\n") {
-        output.write_all(b"\n")?;
-    }
-    output.flush()?;
+    display.suspend_output(|| -> std::io::Result<()> {
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        output.write_all(body)?;
+        if !body.ends_with(b"\n") {
+            output.write_all(b"\n")?;
+        }
+        output.flush()
+    })?;
     if let Some(error) = failure {
-        eprintln!(
+        display.message(&format!(
             "warning: ingestion failed ({}): {}",
             error.code, error.message
-        );
+        ));
         return Ok(ExitCode::FAILURE);
     }
     Ok(ExitCode::SUCCESS)
@@ -132,7 +134,7 @@ fn port(authority: &hyper::http::uri::Authority) -> Result<u16> {
     }
 }
 
-pub async fn run(server: &str) -> Result<ExitCode> {
+pub async fn run(server: &str, display: &mut crate::display::Display) -> Result<ExitCode> {
     ensure!(
         !server.contains('#'),
         "server must be an HTTP origin without a fragment"
@@ -215,7 +217,9 @@ pub async fn run(server: &str) -> Result<ExitCode> {
             bail!("finish server returned {status}");
         }
         ensure!(json, "finish response is not application/json");
-        output(&body)
+        let result = output(&body, display)?;
+        display.update(vec!["Final profile received".to_owned()], true);
+        Ok(result)
     };
     let mut connection = Box::pin(connection);
     tokio::pin!(operation);

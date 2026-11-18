@@ -11,6 +11,8 @@ use tokio::{
 
 use super::{DEADLINE, output, preserve_failure, test_directory};
 
+type DisplayCase<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)], &'a str);
+
 // Literal wire bytes, not JSON reserialized through a floating-point representation.
 const SNAPSHOT: &str = concat!(
     "{\"status\":{\"sample_name\":\"synthetic-sample\",\"state\":\"stopped\",",
@@ -134,6 +136,104 @@ async fn finish_preserves_scientific_digits_and_large_counters_without_waiting_f
     preserve_failure(
         outcome,
         fs::remove_dir_all(directory).wrap_err("remove finish wire fixtures"),
+    )
+}
+
+#[tokio::test]
+async fn plain_display_finish_preserves_exact_json_without_terminal_output() -> Result<()> {
+    let directory = test_directory()?;
+    let outcome = async {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let result = run_reply(
+            &directory,
+            listener,
+            &["--display", "plain", "finish", "--server", &endpoint],
+            &[],
+            &response("200 OK", "application/json", SNAPSHOT),
+            true,
+        )
+        .await?;
+        ensure!(
+            result.status.code() == Some(0),
+            "plain finish failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        ensure!(
+            result.stdout == format!("{SNAPSHOT}\n").as_bytes(),
+            "plain finish stdout must preserve every response byte and append one newline"
+        );
+        ensure!(
+            result.stderr.is_empty(),
+            "successful plain finish must not emit terminal output: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        Ok(())
+    }
+    .await;
+    preserve_failure(
+        outcome,
+        fs::remove_dir_all(directory).wrap_err("remove plain finish wire fixtures"),
+    )
+}
+
+#[tokio::test]
+async fn piped_finish_resolves_display_sources_without_changing_json_or_emitting_ansi() -> Result<()>
+{
+    let directory = test_directory()?;
+    let outcome = async {
+        let cases: &[DisplayCase<'_>] = &[
+            (&[], &[], ""),
+            (&[], &[], "display = 'plain'\n"),
+            (&[], &[("AXYLPH_DISPLAY", "plain")], "display = 'auto'\n"),
+            (&[], &[("AXYLPH_DISPLAY", "auto")], "display = 'plain'\n"),
+            (
+                &["--display", "plain"],
+                &[("AXYLPH_DISPLAY", "invalid")],
+                "display = 'auto'\n",
+            ),
+            (
+                &["--display", "auto"],
+                &[("AXYLPH_DISPLAY", "invalid")],
+                "display = 'plain'\n",
+            ),
+        ];
+        for (flags, environment, file) in cases {
+            fs::write(directory.join("axylph.toml"), file)?;
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("http://{}", listener.local_addr()?);
+            let mut args = flags.to_vec();
+            args.extend(["finish", "--server", &endpoint]);
+            let result = run_reply(
+                &directory,
+                listener,
+                &args,
+                environment,
+                &response("200 OK", "application/json", SNAPSHOT),
+                true,
+            )
+            .await?;
+            ensure!(
+                result.status.code() == Some(0),
+                "display resolution failed for {flags:?}/{environment:?}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            ensure!(
+                result.stdout == format!("{SNAPSHOT}\n").as_bytes(),
+                "display sources must not change finish JSON: {flags:?}/{environment:?}"
+            );
+            ensure!(
+                result.stderr.is_empty(),
+                "piped successful finish must remain quiet: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        Ok(())
+    }
+    .await;
+    preserve_failure(
+        outcome,
+        fs::remove_dir_all(directory).wrap_err("remove display precedence fixtures"),
     )
 }
 

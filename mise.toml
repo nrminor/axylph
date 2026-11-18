@@ -19,7 +19,7 @@ RUSTDOCFLAGS = "-D warnings"
 
 [tasks.check]
 description = "Check formatting, lints, tests, documentation, and schema"
-run = [{ task = "fmt-check" }, { task = "lint" }, { task = "test" }, { task = "test-doc" }, { task = "doc-check" }, { task = "schema-check" }]
+run = [{ task = "fmt-check" }, { task = "lint" }, { task = "lint-no-default-features" }, { task = "test" }, { task = "test-no-default-features" }, { task = "test-doc" }, { task = "doc-check" }, { task = "schema-check" }]
 
 [tasks.schema]
 description = "Regenerate the configuration schema"
@@ -40,6 +40,14 @@ run = "cargo clippy --locked --all-targets --all-features -- -D warnings"
 
 [tasks.test]
 run = "cargo nextest run --locked --all-features --no-tests=pass"
+
+[tasks.lint-no-default-features]
+description = "Lint without optional features"
+run = "cargo clippy --locked --all-targets --no-default-features -- -D warnings"
+
+[tasks.test-no-default-features]
+description = "Test without optional features"
+run = "cargo nextest run --locked --no-default-features --no-tests=pass"
 
 [tasks.test-all]
 run = "cargo nextest run --locked --all-features --no-tests=pass --run-ignored all"

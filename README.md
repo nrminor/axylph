@@ -31,11 +31,19 @@ axylph finish --server http://127.0.0.1:50051 > result.json
 
 Then separately stop the receiver, for example with Ctrl-C. Finish does not shut it down. The receiver listens at `127.0.0.1:50051` by default. Use `serve --listen HOST:PORT` and `send FILE --server http://HOST:PORT` to select another address. There is no authentication or TLS. Use a trusted local network; do not expose this prototype to the public internet.
 
-Every upload to this receiver belongs to the same sample. Without a sample from `--sample`, the environment, or configuration, `serve` generates a name for the run and prints it at startup. `--c` defaults to 200, `--k` to 31, and exact single-end deduplication is enabled by default. Only positive c and k=21/31 are supported. These settings remain fixed until a new receiver is started. There is no sample routing. Finish requires a profiled receiver; a HUD is not implemented.
+Every upload to this receiver belongs to the same sample. Without a sample from `--sample`, the environment, or configuration, `serve` generates a name for the run and prints it at startup. `--c` defaults to 200, `--k` to 31, and exact single-end deduplication is enabled by default. Only positive c and k=21/31 are supported. These settings remain fixed until a new receiver is started. There is no sample routing. Finish requires a profiled receiver.
 
 To enable profiles, supply an existing sylph reference database with `serve --reference PATH` (or the configuration sources below). The reference must be compatible with the selected sketch parameters: startup rejects incompatibility before binding the listener, rather than changing scientific defaults. For example, a c=50 or c=100 reference requires an explicit matching `--c`. Profiled startup reports the resolved reference path and profiling settings with the sample summary. Profiling uses sylph's `ProfileOptions::default()`.
 
 Progress counts start at zero for each upload. A batch receipt follows validation and sketch accumulation; it does not promise a profile or durable storage. A completion report requires a clean input end, successful local parsing, a successful RPC, and matching client/server totals. Completion ends the upload, not the sample. There is no rollback or automatic retry.
+
+## Terminal display
+
+The default-enabled optional `hud` feature provides a monochrome Indicatif inline display on stderr when `--display auto` detects a suitable terminal. `--display plain` selects plain output; non-terminal stderr, `NO_COLOR` set, an unset or `dumb` `TERM`, and builds without `hud` also use plain output. It uses no alternate screen, raw mode, keyboard controls, animation, or top-results view.
+
+The receiver shows exact processed counts separately from the checkpoint covered by an available profile; it does not infer that a profile is computing from their difference. Upload completion is not sample finalization. Ordinary display updates are limited to 4 Hz; warnings remain in scrollback and the final display stays visible. Startup reports the configuration file actually loaded, or that no configuration file was loaded. Warnings and errors go to stderr. Successful `finish` writes JSON to stdout and is quiet in plain mode.
+
+Library consumers can disable the default feature with `default-features = false` to avoid the HUD's Indicatif terminal dependency; a CLI built without it uses plain output.
 
 On disconnect, accepted reads remain in memory. A submitted batch can finish after cancellation, and its receipt can be lost. **Do not replay an uncertain upload:** biological deduplication is not transport replay suppression. A new upload may briefly receive `RESOURCE_EXHAUSTED` while the previous batch finishes. Restarting the process loses all accumulated state.
 
@@ -45,6 +53,7 @@ Values resolve in order: command-line option, environment variable, TOML file, t
 
 ```toml
 #:schema ./axylph.schema.json
+display = "auto"
 batch_bytes = 1048576
 batch_reads = 1024
 
@@ -62,7 +71,7 @@ server = "http://127.0.0.1:50051"
 server = "http://127.0.0.1:50051"
 ```
 
-The schema path is relative to the TOML file. Profiling is selected with `--reference`, `AXYLPH_REFERENCE`, or `[serve] reference`. A relative reference path from TOML is relative to the selected configuration file's directory; a relative CLI or environment path is relative to the current working directory. Without a reference, the receiver is sketch-only and explicitly setting profiling tuning options is an error.
+The schema path is relative to the TOML file. Display mode is selected with `--display auto|plain`, `AXYLPH_DISPLAY`, or the root `display` key, using the precedence above. Profiling is selected with `--reference`, `AXYLPH_REFERENCE`, or `[serve] reference`. A relative reference path from TOML is relative to the selected configuration file's directory; a relative CLI or environment path is relative to the current working directory. Without a reference, the receiver is sketch-only and explicitly setting profiling tuning options is an error.
 
 `--profile-workers`, `AXYLPH_PROFILE_WORKERS`, or `[serve] profile_workers` sets the positive size of the separate profiling worker pool. `--refresh-interval-ms`, `AXYLPH_REFRESH_INTERVAL_MS`, or `[serve] refresh_interval_ms` sets positive minimum refresh start spacing in milliseconds (default 1000). The default profiling pool has two workers when at least two CPUs are available, otherwise one. The CLI's separate async runtime also uses two or one workers by the same rule; neither pool is a whole-process CPU quota.
 

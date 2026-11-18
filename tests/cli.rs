@@ -210,6 +210,72 @@ async fn verify_startup_and_upload(stderr: ChildStderr) -> Result<()> {
     Ok(())
 }
 
+async fn startup_reports_config(directory: &Path, args: &[&str], expected: &str) -> Result<()> {
+    let mut child = binary(directory, args, &[]).spawn()?;
+    let outcome = timeout(DEADLINE, async {
+        let stderr = child.stderr.take().ok_or_else(|| eyre!("missing stderr"))?;
+        let mut lines = BufReader::new(stderr.take(16_384)).lines();
+        let mut diagnostics = String::new();
+        let mut started = false;
+        while let Some(line) = lines.next_line().await? {
+            started |= line.starts_with("Accumulating sample ");
+            diagnostics.push_str(&line);
+            diagnostics.push('\n');
+            // Neither output ordering nor a particular provenance label is contractual.
+            if started && diagnostics.contains(expected) {
+                return Ok(());
+            }
+        }
+        bail!("expected startup and config provenance {expected:?}; stderr:\n{diagnostics}")
+    })
+    .await
+    .wrap_err_with(|| {
+        format!("startup must report config provenance {expected:?} within five seconds")
+    })
+    .and_then(|result| result);
+    let cleanup = timeout(DEADLINE, child.kill())
+        .await
+        .wrap_err("timed out killing/reaping config provenance CLI")
+        .and_then(|result| result.wrap_err("kill/reap config provenance CLI"));
+    preserve_failure(outcome, cleanup)
+}
+
+#[tokio::test]
+async fn server_startup_reports_the_absolute_path_of_its_loaded_configuration() -> Result<()> {
+    let directory = test_directory()?;
+    let outcome = async {
+        let config = directory.join("loaded.toml");
+        fs::write(
+            &config,
+            "[serve]\nsample = 'config-provenance'\nlisten = '127.0.0.1:0'\n",
+        )?;
+        let config_path = config
+            .to_str()
+            .ok_or_else(|| eyre!("test config path must be UTF-8"))?;
+        startup_reports_config(&directory, &["--config", config_path], config_path).await
+    }
+    .await;
+    preserve_failure(
+        outcome,
+        fs::remove_dir_all(directory).wrap_err("remove config provenance fixtures"),
+    )
+}
+
+#[tokio::test]
+async fn server_startup_reports_defaults_when_implicit_configuration_is_absent() -> Result<()> {
+    let directory = test_directory()?;
+    let outcome = startup_reports_config(
+        &directory,
+        &["--sample", "defaults-provenance", "--listen", "127.0.0.1:0"],
+        "no configuration file loaded",
+    )
+    .await;
+    preserve_failure(
+        outcome,
+        fs::remove_dir_all(directory).wrap_err("remove default provenance fixtures"),
+    )
+}
+
 async fn run_configured_binary(directory: &Path) -> Result<()> {
     let config = directory.join("axylph.toml");
     fs::write(
@@ -387,6 +453,46 @@ async fn assert_failure(
         "expected {diagnostic:?} for {args:?}, stderr: {stderr}"
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn active_commands_reject_invalid_display_sources_and_structurally_invalid_file_values()
+-> Result<()> {
+    let directory = test_directory()?;
+    let outcome = async {
+        for command in ["serve", "send", "finish"] {
+            let mut args = vec!["--display", "invalid", command];
+            if command == "send" {
+                args.push("missing.fastq");
+            }
+            assert_failure(&directory, &args, &[], "invalid").await?;
+            let mut args = vec![command];
+            if command == "send" {
+                args.push("missing.fastq");
+            }
+            assert_failure(
+                &directory,
+                &args,
+                &[("AXYLPH_DISPLAY", "invalid")],
+                "invalid",
+            )
+            .await?;
+        }
+        // Enum deserialization is structural: later sources cannot hide malformed TOML.
+        fs::write(directory.join("axylph.toml"), "display = 'invalid'\n")?;
+        assert_failure(
+            &directory,
+            &["--display", "plain", "finish"],
+            &[("AXYLPH_DISPLAY", "auto")],
+            "invalid",
+        )
+        .await
+    }
+    .await;
+    preserve_failure(
+        outcome,
+        fs::remove_dir_all(directory).wrap_err("remove invalid display fixtures"),
+    )
 }
 
 #[tokio::test]
@@ -857,6 +963,67 @@ async fn configured_binary_rejects_missing_reference_before_announcing_startup()
     preserve_failure(
         outcome,
         fs::remove_dir_all(&directory).wrap_err("remove missing-reference CLI fixtures"),
+    )
+}
+
+#[tokio::test]
+async fn profiling_options_require_reference_and_respect_overrides() -> Result<()> {
+    let directory = test_directory()?;
+    let outcome = async {
+        assert_failure(
+            &directory,
+            &["--profile-workers", "1"],
+            &[],
+            "profiling options require a reference",
+        )
+        .await?;
+        assert_failure(
+            &directory,
+            &["--refresh-interval-ms", "0"],
+            &[],
+            "profiling options require a reference",
+        )
+        .await?;
+        assert_failure(
+            &directory,
+            &["--reference", "missing", "--profile-workers", "0"],
+            &[],
+            "profile workers and refresh interval must be positive",
+        )
+        .await?;
+        assert_failure(
+            &directory,
+            &["--reference", "missing", "--refresh-interval-ms", "0"],
+            &[],
+            "profile workers and refresh interval must be positive",
+        )
+        .await?;
+        let config = reference_fixture_config(&directory)?;
+        let config_argument = config
+            .to_str()
+            .ok_or_else(|| eyre!("non-UTF-8 config path"))?;
+        startup(
+            &directory.join("cwd"),
+            &[
+                "--config",
+                config_argument,
+                "--profile-workers",
+                "1",
+                "--refresh-interval-ms",
+                "17",
+            ],
+            &[
+                ("AXYLPH_PROFILE_WORKERS", "invalid"),
+                ("AXYLPH_REFRESH_INTERVAL_MS", "invalid"),
+            ],
+            &["profile_workers=1", "refresh_interval_ms=17"],
+        )
+        .await
+    }
+    .await;
+    preserve_failure(
+        outcome,
+        fs::remove_dir_all(&directory).wrap_err("remove profiling option fixtures"),
     )
 }
 

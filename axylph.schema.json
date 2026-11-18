@@ -13,6 +13,9 @@
       "format": "uint",
       "minimum": 0
     },
+    "display": {
+      "$ref": "#/definitions/DisplayMode"
+    },
     "finish": {
       "$ref": "#/definitions/FileSend"
     },
@@ -25,6 +28,21 @@
   },
   "additionalProperties": false,
   "definitions": {
+    "DisplayMode": {
+      "description": "Terminal presentation preference.",
+      "oneOf": [
+        {
+          "description": "Select interactive presentation when available.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "Use plain output.",
+          "type": "string",
+          "const": "plain"
+        }
+      ]
+    },
     "FileSend": {
       "type": "object",
       "properties": {

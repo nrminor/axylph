@@ -21,6 +21,7 @@
 !/src/
 !/src/client.rs
 !/src/config.rs
+!/src/display.rs
 !/src/error.rs
 !/src/finish.rs
 !/src/http.rs

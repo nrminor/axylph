@@ -6,6 +6,10 @@ rust-version = "1.99.1"
 publish = false
 description = "Read streaming for a future sylph profiling service"
 
+[features]
+default = ["hud"]
+hud = ["dep:indicatif"]
+
 [dependencies]
 arrow-array = "=60.1.0"
 arrow-flight = { version = "=60.1.0", default-features = false }
@@ -19,6 +23,7 @@ futures-util = { version = "=0.3.34", default-features = false, features = ["std
 http-body-util = "=0.1.5"
 hyper = { version = "=1.12.0", default-features = false, features = ["client", "http1"] }
 hyper-util = { version = "=0.1.21", default-features = false, features = ["server-auto", "service", "tokio", "http1", "http2"] }
+indicatif = { version = "=0.18.4", default-features = false, features = ["improved_unicode"], optional = true }
 flate2 = "=1.1.11"
 seq_io = "=0.3.4"
 serde = { version = "=1.0.229", features = ["derive"] }

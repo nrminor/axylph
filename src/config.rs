@@ -3,10 +3,13 @@
 use std::{env, fs, net::SocketAddr, path::PathBuf, str::FromStr, time::SystemTime};
 
 use axylph::Limits;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::Deserialize;
+use sylph::read_sketch::{Deduplication, SketchParams};
+
+use crate::server;
 
 #[derive(Parser)]
 #[command(
@@ -14,6 +17,9 @@ use serde::Deserialize;
     about = "Accumulate sequencing read sketches, with optional reference profiling."
 )]
 struct Cli {
+    /// Terminal presentation (auto or plain).
+    #[arg(long, global = true, value_enum)]
+    display: Option<DisplayMode>,
     /// Path to a TOML configuration file.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
@@ -101,6 +107,9 @@ enum CliCommand {
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "DisplayMode")]
+    display: Option<DisplayMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "usize")]
     batch_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -154,30 +163,53 @@ struct FileSend {
     server: Option<String>,
 }
 
+/// Resolved executable operation.
 pub enum Command {
-    Serve {
-        listen: SocketAddr,
-        sample: String,
-        c: usize,
-        k: usize,
-        no_dedup: bool,
-        reference: Option<PathBuf>,
-        profile_workers: usize,
-        refresh_interval_ms: u64,
-    },
+    /// Run the receiver with the resolved settings.
+    Serve(server::Settings),
+    /// Upload a FASTQ file.
     Send {
+        /// Input FASTQ path.
         path: PathBuf,
+        /// Receiver HTTP origin.
         server: String,
     },
+    /// Finish the receiver's current sample.
     Finish {
+        /// Receiver HTTP origin.
         server: String,
     },
+    /// Print the configuration schema.
     Schema,
 }
 
+/// Configuration resolved for the selected operation.
 pub struct Resolved {
+    /// Operation to execute.
     pub command: Command,
+    /// Limits for ingestion or upload batches.
     pub limits: Limits,
+    /// Terminal presentation mode.
+    pub display: DisplayMode,
+}
+
+/// Terminal presentation preference.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum DisplayMode {
+    #[default]
+    /// Select interactive presentation when available.
+    Auto,
+    /// Use plain output.
+    Plain,
+}
+
+impl FromStr for DisplayMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        <Self as ValueEnum>::from_str(value, false)
+    }
 }
 
 fn environment<T: FromStr>(name: &str) -> Result<Option<T>>
@@ -214,7 +246,7 @@ where
     Ok(environment(name)?.or(file).unwrap_or(default))
 }
 
-fn load(path: Option<PathBuf>) -> Result<(FileConfig, PathBuf)> {
+fn load(path: Option<PathBuf>) -> Result<(FileConfig, PathBuf, Option<PathBuf>)> {
     let (path, implicit) = path.map_or_else(
         || {
             env::var_os("AXYLPH_CONFIG").map_or_else(
@@ -225,19 +257,24 @@ fn load(path: Option<PathBuf>) -> Result<(FileConfig, PathBuf)> {
         |path| (path, false),
     );
     let path = std::path::absolute(path)?;
-    let config = match fs::read_to_string(&path) {
-        Ok(text) => toml::from_str(&text)
-            .wrap_err_with(|| format!("invalid configuration {}", path.display())),
+    let (config, loaded) = match fs::read_to_string(&path) {
+        Ok(text) => (
+            toml::from_str(&text)
+                .wrap_err_with(|| format!("invalid configuration {}", path.display()))?,
+            Some(path.clone()),
+        ),
         Err(error) if implicit && error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(FileConfig::default())
+            (FileConfig::default(), None)
         }
         Err(error) => {
-            Err(error).wrap_err_with(|| format!("could not read configuration {}", path.display()))
+            return Err(error)
+                .wrap_err_with(|| format!("could not read configuration {}", path.display()));
         }
-    }?;
-    Ok((config, path))
+    };
+    Ok((config, path, loaded))
 }
 
+/// Choose a conservative default worker count for the host.
 pub fn worker_count() -> usize {
     if std::thread::available_parallelism().is_ok_and(|count| count.get() >= 2) {
         2
@@ -250,13 +287,13 @@ fn profiling(
     args: &ServeArgs,
     serve: &FileServe,
     config_path: &std::path::Path,
-) -> Result<(Option<PathBuf>, usize, u64)> {
-    let reference = if let Some(path) = args.reference.clone() {
+) -> Result<Option<server::Profiling>> {
+    let reference = if let Some(path) = &args.reference {
         Some(std::path::absolute(path)?)
     } else if let Some(path) = environment::<PathBuf>("AXYLPH_REFERENCE")? {
         Some(std::path::absolute(path)?)
     } else {
-        serve.reference.clone().map(|path| {
+        serve.reference.as_ref().map(|path| {
             config_path
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("/"))
@@ -276,23 +313,38 @@ fn profiling(
     if reference.is_none() && (workers.is_some() || interval.is_some()) {
         bail!("profiling options require a reference");
     }
-    let profile_workers = workers.unwrap_or_else(worker_count);
-    let refresh_interval_ms = interval.unwrap_or(1000);
-    if profile_workers == 0 || refresh_interval_ms == 0 {
-        bail!("profile workers and refresh interval must be positive");
-    }
-    Ok((reference, profile_workers, refresh_interval_ms))
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    let workers = workers.unwrap_or_else(worker_count);
+    let interval = std::time::Duration::from_millis(interval.unwrap_or(1000));
+    Ok(Some(server::Profiling::new(reference, workers, interval)?))
 }
 
+/// Parse arguments and resolve active configuration sources.
+///
+/// # Errors
+/// Returns an error if an active configuration source is invalid or cannot be read.
 pub fn parse() -> Result<Resolved> {
     let cli = Cli::parse();
     if matches!(cli.command, Some(CliCommand::Schema)) {
         return Ok(Resolved {
             command: Command::Schema,
             limits: Limits::default(),
+            display: DisplayMode::Auto,
         });
     }
-    let (file, config_path) = load(cli.config)?;
+    resolve_cli(cli)
+}
+
+fn resolve_cli(cli: Cli) -> Result<Resolved> {
+    let (file, config_path, loaded_path) = load(cli.config.clone())?;
+    let display = resolve(
+        cli.display,
+        "AXYLPH_DISPLAY",
+        file.display,
+        DisplayMode::Auto,
+    )?;
     if let Some(CliCommand::Finish { server }) = cli.command {
         if cli.batch_bytes.is_some() || cli.batch_reads.is_some() || cli.serve.supplied() {
             bail!("serve and batch options cannot be used with finish");
@@ -307,22 +359,10 @@ pub fn parse() -> Result<Resolved> {
                 )?,
             },
             limits: Limits::default(),
+            display,
         });
     }
-    let limits = Limits::new(
-        resolve(
-            cli.batch_bytes,
-            "AXYLPH_BATCH_BYTES",
-            file.batch_bytes,
-            1_048_576,
-        )?,
-        resolve(
-            cli.batch_reads,
-            "AXYLPH_BATCH_READS",
-            file.batch_reads,
-            1024,
-        )?,
-    )?;
+    let limits = batch_limits(&cli, &file)?;
     let command = match cli.command {
         Some(CliCommand::Send { path, server }) => {
             if cli.serve.supplied() {
@@ -342,8 +382,7 @@ pub fn parse() -> Result<Resolved> {
         Some(CliCommand::Finish { .. }) => bail!("finish was already resolved"),
         Some(CliCommand::Serve) | None => {
             let serve = file.serve.unwrap_or_default();
-            let (reference, profile_workers, refresh_interval_ms) =
-                profiling(&cli.serve, &serve, &config_path)?;
+            let profiling = profiling(&cli.serve, &serve, &config_path)?;
             let optional_sample = match cli.serve.sample {
                 Some(sample) => Some(sample),
                 None => environment("AXYLPH_SAMPLE")?.or(serve.sample),
@@ -370,21 +409,57 @@ pub fn parse() -> Result<Resolved> {
             } else {
                 None
             };
-            Command::Serve {
+            let c = resolve(cli.serve.c, "AXYLPH_C", serve.c, 200)?;
+            let k = resolve(cli.serve.k, "AXYLPH_K", serve.k, 31)?;
+            let dedup = resolve(dedup_arg, "AXYLPH_DEDUP", serve.dedup, true)?;
+            let deduplication = if dedup {
+                Deduplication::Exact
+            } else {
+                Deduplication::Disabled
+            };
+            let params = SketchParams {
+                c,
+                k,
+                deduplication,
+            };
+            let settings = server::Settings {
                 listen,
                 sample,
-                c: resolve(cli.serve.c, "AXYLPH_C", serve.c, 200)?,
-                k: resolve(cli.serve.k, "AXYLPH_K", serve.k, 31)?,
-                no_dedup: !resolve(dedup_arg, "AXYLPH_DEDUP", serve.dedup, true)?,
-                reference,
-                profile_workers,
-                refresh_interval_ms,
-            }
+                params,
+                limits,
+                profiling,
+                config_path: loaded_path,
+            };
+            Command::Serve(settings)
         }
     };
-    Ok(Resolved { command, limits })
+    Ok(Resolved {
+        command,
+        limits,
+        display,
+    })
 }
 
+fn batch_limits(cli: &Cli, file: &FileConfig) -> Result<Limits> {
+    let bytes = resolve(
+        cli.batch_bytes,
+        "AXYLPH_BATCH_BYTES",
+        file.batch_bytes,
+        1_048_576,
+    )?;
+    let reads = resolve(
+        cli.batch_reads,
+        "AXYLPH_BATCH_READS",
+        file.batch_reads,
+        1024,
+    )?;
+    Ok(Limits::new(bytes, reads)?)
+}
+
+/// Print the partial configuration JSON Schema.
+///
+/// # Errors
+/// Returns an error if the schema cannot be serialized.
 pub fn print_schema() -> Result<()> {
     let schema = SchemaSettings::draft07()
         .into_generator()
