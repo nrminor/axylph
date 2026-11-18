@@ -22,9 +22,19 @@ pub use session::{
 };
 
 /// Bounds for one decoded read batch, not the total upload.
+///
+/// ```
+/// use axylph::Limits;
+///
+/// assert!(Limits::new(4096, 32).is_ok());
+/// assert!(Limits::new(0, 32).is_err());
+/// assert!(Limits::new(1_048_577, 32).is_err());
+/// ```
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
+    /// Maximum combined identifier, sequence, and quality bytes in a batch.
     pub(crate) batch_bytes: usize,
+    /// Maximum number of reads in a batch.
     pub(crate) batch_reads: usize,
 }
 

@@ -19,7 +19,9 @@ use crate::{
 /// Counts include duplicates and reads contributing no markers.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ProcessedCheckpoint {
+    /// Fully processed reads, including duplicates and reads without markers.
     pub(crate) reads: u64,
+    /// Sequence bases in the fully processed prefix.
     pub(crate) bases: u64,
 }
 
@@ -96,10 +98,15 @@ pub enum SessionState {
 /// Current progress can be ahead of the latest successful profile's checkpoint.
 #[derive(Clone, Debug, Default)]
 pub struct Observation {
+    /// Latest fully processed prefix.
     pub(crate) processed: ProcessedCheckpoint,
+    /// Most recent successful calculation, possibly behind `processed`.
     pub(crate) snapshot: Option<Arc<ProfileSnapshot>>,
+    /// Worker and admission lifecycle.
     pub(crate) state: SessionState,
+    /// Persistent ingestion or worker failure, if recorded.
     pub(crate) ingestion_error: Option<Arc<Error>>,
+    /// Most recent refresh failure since the last successful calculation.
     pub(crate) refresh_error: Option<Arc<RefreshFailure>>,
     finish_outcome: Option<Result<Arc<ProfileSnapshot>, Arc<Error>>>,
 }
@@ -150,13 +157,32 @@ impl Observation {
 /// the owner requests stopping but cannot await or interrupt synchronous work.
 /// Upload EOF does not stop the session. [`Self::finish`] explicitly requests a
 /// profile of the terminal processed prefix; shutdown alone does not finalize it.
+///
+/// A profiler must already own compatible references and options. Start the
+/// session on a Tokio runtime with its time driver enabled:
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use axylph::{Error, Session};
+/// use sylph::profile::Profiler;
+///
+/// async fn analyze(profiler: Profiler) -> Result<(), Arc<Error>> {
+///     let session = Session::builder("sample", profiler).start()?;
+///     let _router = session.router();
+///     // Serve the router and upload reads before requesting finality.
+///     let final_profile = session.finish().await?;
+///     println!("processed {} reads", final_profile.checkpoint().reads());
+///     session.shutdown().await?;
+///     Ok(())
+/// }
+/// ```
 pub struct Session {
     receiver: Receiver,
     sample_name: Arc<str>,
     worker: Shared<BoxFuture<'static, Result<(), Arc<Error>>>>,
 }
 
-// A finish capability shares completion bookkeeping, never the session owner.
+/// Shared completion capability that does not retain the session owner.
 #[derive(Clone)]
 pub struct FinishHandle {
     ingestion: Arc<Ingestion>,
@@ -164,6 +190,7 @@ pub struct FinishHandle {
 }
 
 impl FinishHandle {
+    /// Request terminal profiling and await its retained outcome.
     pub async fn finish(&self) -> Result<Arc<ProfileSnapshot>, Arc<Error>> {
         if self.ingestion.close(CloseReason::Finish) != CloseReason::Finish {
             return Err(Arc::new(Error::SessionClosed));
@@ -339,6 +366,7 @@ impl Drop for Session {
     }
 }
 
+/// Yield the current observation followed by coalesced updates through shutdown.
 pub fn observations(
     mut updates: watch::Receiver<Arc<Observation>>,
 ) -> impl Stream<Item = Arc<Observation>> + Send {

@@ -30,6 +30,23 @@ use crate::{
 };
 
 /// Sends FASTQ reads as Arrow batches and reports receiver validation counts.
+///
+/// This example requires a running Flight receiver at the endpoint:
+///
+/// ```no_run
+/// use std::io::Cursor;
+/// use axylph::{Client, Error, Limits};
+///
+/// async fn upload() -> Result<(), Error> {
+///     let client = Client::new("http://127.0.0.1:50051".into(), Limits::default());
+///     let fastq = Cursor::new(&b"@read1\nACGT\n+\nIIII\n"[..]);
+///     let completed = client.send(fastq, |progress| {
+///         println!("{} reads validated", progress.reads);
+///     }).await?;
+///     assert!(completed.complete);
+///     Ok(())
+/// }
+/// ```
 pub struct Client {
     endpoint: String,
     limits: Limits,

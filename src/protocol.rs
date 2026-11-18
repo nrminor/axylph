@@ -9,8 +9,10 @@ use tonic::Status;
 
 use crate::{Limits, Progress};
 
+/// Maximum encoded Flight message size, including protocol overhead.
 pub const MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Shared version-zero Arrow schema for read uploads.
 pub fn schema() -> SchemaRef {
     static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
     Arc::clone(SCHEMA.get_or_init(|| {
@@ -26,11 +28,12 @@ pub fn schema() -> SchemaRef {
 }
 
 impl Progress {
-    pub(crate) fn record<'a>(
-        &mut self,
-        batch: &'a RecordBatch,
+    /// Validate a decoded batch and return its prospective per-upload receipt totals.
+    pub(crate) fn record(
+        self,
+        batch: &RecordBatch,
         limits: Limits,
-    ) -> Result<&'a BinaryArray, Status> {
+    ) -> Result<(Self, &BinaryArray), Status> {
         if batch.schema() != schema() {
             return Err(Status::invalid_argument(
                 "expected the axylph version 0 read schema",
@@ -104,8 +107,13 @@ impl Progress {
             .bases
             .checked_add(bases)
             .ok_or_else(|| Status::resource_exhausted("base count overflow"))?;
-        self.reads = reads;
-        self.bases = bases;
-        Ok(sequences)
+        Ok((
+            Self {
+                reads,
+                bases,
+                ..self
+            },
+            sequences,
+        ))
     }
 }

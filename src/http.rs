@@ -85,6 +85,7 @@ async fn finish(
     ([(header::CACHE_CONTROL, "no-store")], response)
 }
 
+/// Combine Flight ingestion with observation and finalization endpoints.
 pub fn router(
     flight: Router,
     sample_name: Arc<str>,

@@ -134,6 +134,7 @@ fn port(authority: &hyper::http::uri::Authority) -> Result<u16> {
     }
 }
 
+/// Request, validate, and print the server's bounded final-profile response.
 pub async fn run(server: &str, display: &mut crate::display::Display) -> Result<ExitCode> {
     ensure!(
         !server.contains('#'),

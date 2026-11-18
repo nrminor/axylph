@@ -32,9 +32,30 @@ type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'stati
 ///
 /// Clones share the sketch and upload gate. Upload completion and disconnects
 /// do not reset the sketch. State is in memory only and grows with the sample.
+///
+/// A fresh sketch-only receiver can report its processed prefix without a
+/// profiler or a network connection:
+///
+/// ```
+/// use axylph::{Error, Limits, Receiver};
+/// use sylph::read_sketch::{ReadSketcher, SketchParams};
+///
+/// # fn main() -> Result<(), Error> {
+/// let sketcher = ReadSketcher::new(
+///     SketchParams::default(), "axylph".into(), Some("sample".into()),
+/// )?;
+/// let receiver = Receiver::new(Limits::default(), sketcher);
+/// let status = receiver.ingestion_status();
+/// assert_eq!(status.processed.reads(), 0);
+/// assert_eq!(status.processed.bases(), 0);
+/// assert!(status.ingestion_error.is_none());
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct Receiver {
     limits: Limits,
+    /// Shared sketch, admission gate, and observation state.
     pub(crate) ingestion: Arc<Ingestion>,
 }
 
@@ -48,19 +69,25 @@ pub struct IngestionStatus {
     pub ingestion_error: Option<Arc<Error>>,
 }
 
+/// Shared scientific state and admission bookkeeping for a receiver.
 pub struct Ingestion {
     upload: Arc<Semaphore>,
     state: Mutex<SketchState>,
     // Held before submission and throughout each blocking ingestion job, even
     // if the response future is dropped. This lets shutdown drain admitted work.
     work: Arc<AsyncMutex<()>>,
+    /// First closure request, retained as the terminal intent.
     pub(crate) closed: watch::Sender<Option<CloseReason>>,
+    /// Latest coherent published state.
     pub(crate) observations: watch::Sender<Arc<Observation>>,
 }
 
+/// The first operation to close read admission determines terminal intent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CloseReason {
+    /// Drain and produce a terminal profile.
     Finish,
+    /// Drain without requesting a terminal profile.
     Shutdown,
 }
 
@@ -70,9 +97,13 @@ struct SketchState {
     failure: Option<Arc<Error>>,
 }
 
+/// Scientific input and checkpoint captured together for a periodic calculation.
 pub struct ProfileCapture {
+    /// Clone of the marker map, preserving its iteration order.
     pub(crate) sketch: SequencesSketch,
+    /// Processed prefix represented by the sketch.
     pub(crate) checkpoint: ProcessedCheckpoint,
+    /// Capture start used to schedule the next periodic attempt.
     pub(crate) started_at: Instant,
 }
 
@@ -84,6 +115,7 @@ impl Ingestion {
         Ok(())
     }
 
+    /// Close admission once and return the winning terminal intent.
     pub(crate) fn close(&self, reason: CloseReason) -> CloseReason {
         let mut selected = reason;
         // The first request closes admission and fixes the terminal intent before
@@ -102,10 +134,12 @@ impl Ingestion {
         selected
     }
 
+    /// Wait until admitted blocking ingestion work has released its gate.
     pub(crate) async fn drain(&self) {
         let _idle = self.work.lock().await;
     }
 
+    /// Capture newer input while admission remains open, or return no work.
     pub(crate) fn capture(
         &self,
         after: ProcessedCheckpoint,
@@ -125,13 +159,14 @@ impl Ingestion {
         }))
     }
 
+    /// Read the authoritative processed prefix under the scientific state lock.
     pub(crate) fn checkpoint(&self) -> Result<ProcessedCheckpoint, Error> {
         let state = self.state.lock().map_err(|_| Error::SketchPoisoned)?;
         Ok(state.processed)
     }
 
-    // The session calls this only after closing admission and draining its work.
-    // Unlike periodic capture, an empty terminal sample also needs a result.
+    /// Capture terminal input after admission closes and admitted work drains.
+    /// Unlike periodic capture, this also captures an empty sample.
     pub(crate) fn capture_terminal(&self) -> Result<(SequencesSketch, ProcessedCheckpoint), Error> {
         let state = self.state.lock().map_err(|_| Error::SketchPoisoned)?;
         Ok((state.sketcher.sketch().clone(), state.processed))
@@ -465,9 +500,9 @@ impl FlightService for Receiver {
                 progress = tokio::task::spawn_blocking(move || {
                     let _permit = batch_permit;
                     let _work = work;
-                    let sequences = progress.record(&batch, limits)?;
+                    let (next, sequences) = progress.record(&batch, limits)?;
                     ingestion.extend(sequences)?;
-                    Ok::<_, Status>(progress)
+                    Ok::<_, Status>(next)
                 }).await.map_err(|error| Status::internal(Error::ReceiverTask(error).to_string()))??;
                 let metadata = serde_json::to_vec(&progress)
                     .map_err(|error| Status::internal(error.to_string()))?;
