@@ -1,68 +1,113 @@
-# axylph
+# Axylph: incremental metagenomic profiling on the backend
 
-Axylph receives sequencing reads and accumulates a single-end sylph sketch for one sample. With a reference, the command-line receiver periodically publishes cumulative metagenomic profiles; without one, it is sketch-only. The library also exposes profiling through `Session`. **Neither mode retains raw reads or saves recovery state.**
+Axylph is a streaming metagenomic profiler meant to be deployed as a service on your backend infrastructure. It wraps the [Sylph metagenomic profiler](https://github.com/bluenote-1577/sylph), built as a library, in HTTP endpoints with [Axum](https://github.com/tokio-rs/axum) (Axylph is a portmanteau of Axum and Sylph).
 
-The instrument client reads plain or gzip FASTQ and sends Arrow batches through Flight `DoPut`. The receiver runs on Axum and keeps one accumulator across uploads and disconnects. It returns upload-local counts after each batch is validated and sketched. Client logic is separate from terminal output so a future GUI can use the same interface.
+Axylph bundles a client and a server. Its default mode is a server mode, which waits for sequencing reads as they arrive on the configured address and port. It also comes with a client mode, which can be run where sequencing reads are published to send them over the wire to the server using [Arrow Flight protocol](https://arrow.apache.org/docs/format/Flight.html).
 
-```text
-FASTQ file → client → Arrow Flight → receiver → cumulative sketch
-                                        └──→ upload-local receipts
-```
+Unlike the Sylph command line app, Axylph supports incremental profiling, where the profile updates as new reads stream in. This makes it possible to build realtime dashboards showing the taxonomic breakdown of a sample, for example, as reads are published by an Oxford Nanopore instrument. Note that this is only practical because of the excellent performance of Sylph!
 
-## Try the prototype
+## Start profiling
 
-Install from the checkout with `cargo install --locked --path .` and ensure `~/.cargo/bin` is on your `PATH`. Then start the receiver from any directory:
+Start a server with a Sylph reference database. It keeps the reference loaded and refreshes the sample's profile as reads arrive:
 
 ```sh
-axylph serve --sample sample-1 --reference reference.syldb
+# This example assumes a reference with k=31 and minimum c=50.
+axylph serve \
+  --sample run-001 \
+  --reference /data/references/reference.syldb \
+  --c 50 \
+  --k 31
 ```
 
-In another terminal, send a file:
+The terminal HUD shows connection details, live read/base counts, and profile status. The server listens on `127.0.0.1:50051` by default; add `--listen 0.0.0.0:50051` to accept clients from other machines. Use a trusted network: authentication and TLS must be provided outside Axylph.
+
+Match `k` to your reference and choose a positive `c` no greater than the reference's minimum `c`. Running just `axylph` starts a sketch-only server; adding `--reference` enables profiling.
+
+Currently, each Axylph instance assumes it's receiving reads for a single sample-level entity. This may change in the future.
+
+## Send reads as they arrive
+
+In another terminal, use the same executable as a client. Send completed FASTQ files sequentially, either plain or gzip-compressed:
 
 ```sh
-axylph send reads.fastq.gz
+axylph send reads-001.fastq.gz
+axylph send reads-002.fastq.gz
 ```
 
-After sending all batches, explicitly finalize the sample and save its result:
+Each upload adds to the same sample. You can run the client alongside your sequencing instrument and the server on a separate backend:
 
 ```sh
-axylph finish --server http://127.0.0.1:50051 > result.json
+axylph send reads-003.fastq.gz --server http://sequencer-backend:50051
 ```
 
-Then separately stop the receiver, for example with Ctrl-C. Finish does not shut it down. The receiver listens at `127.0.0.1:50051` by default. Use `serve --listen HOST:PORT` and `send FILE --server http://HOST:PORT` to select another address. There is no authentication or TLS. Use a trusted local network; do not expose this prototype to the public internet.
+## Follow the profile
 
-Every upload to this receiver belongs to the same sample. Without a sample from `--sample`, the environment, or configuration, `serve` generates a name for the run and prints it at startup. `--c` defaults to 200, `--k` to 31, and exact single-end deduplication is enabled by default. Only positive c and k=21/31 are supported. These settings remain fixed until a new receiver is started. There is no sample routing. Finish requires a profiled receiver.
+To see the updating profile, open another terminal and subscribe to the running server. For example, with curl:
 
-To enable profiles, supply an existing sylph reference database with `serve --reference PATH` (or the configuration sources below). The reference must be compatible with the selected sketch parameters: startup rejects incompatibility before binding the listener, rather than changing scientific defaults. For example, a c=50 or c=100 reference requires an explicit matching `--c`. Profiled startup reports the resolved reference path and profiling settings with the sample summary. Profiling uses sylph's `ProfileOptions::default()`.
+```sh
+curl --no-buffer http://127.0.0.1:50051/events
+```
 
-Progress counts start at zero for each upload. A batch receipt follows validation and sketch accumulation; it does not promise a profile or durable storage. A completion report requires a clean input end, successful local parsing, a successful RPC, and matching client/server totals. Completion ends the upload, not the sample. There is no rollback or automatic retry.
+Leave this running while the Axylph client sends FASTQ files. It prints live Server-Sent Events: `snapshot` events contain the cumulative profile in `profile.rows`, and `status` events report processing progress. Each connection starts with the current snapshot; `profile` is `null` until the first successful calculation. Subsequent snapshots contain the complete updated profile, so you can follow how the results change as more reads arrive.
 
-## Terminal display
+The server exposes all three interfaces on the same address and port:
 
-The default-enabled optional `hud` feature provides a monochrome Indicatif inline display on stderr when `--display auto` detects a suitable terminal. `--display plain` selects plain output; non-terminal stderr, `NO_COLOR` set, an unset or `dumb` `TERM`, and builds without `hud` also use plain output. It uses no alternate screen, raw mode, keyboard controls, animation, or top-results view.
+| Interface | Purpose |
+| --- | --- |
+| Arrow Flight `DoPut` | Receive read batches from `axylph send`. |
+| `GET /events` | Stream status and cumulative profiles as Server-Sent Events. |
+| `POST /finish` | Return the final profile, used by `axylph finish`. |
 
-The receiver shows exact processed counts separately from the checkpoint covered by an available profile; it does not infer that a profile is computing from their difference. Upload completion is not sample finalization. Ordinary display updates are limited to 4 Hz; warnings remain in scrollback and the final display stays visible. Startup reports the configuration file actually loaded, or that no configuration file was loaded. Warnings and errors go to stderr. Successful `finish` writes JSON to stdout and is quiet in plain mode.
+The observation and finish endpoints require profiling to be enabled.
 
-Library consumers can disable the default feature with `default-features = false` to avoid the HUD's Indicatif terminal dependency; a CLI built without it uses plain output.
+## Save the result
 
-On disconnect, accepted reads remain in memory. A submitted batch can finish after cancellation, and its receipt can be lost. **Do not replay an uncertain upload:** biological deduplication is not transport replay suppression. A new upload may briefly receive `RESOURCE_EXHAUSTED` while the previous batch finishes. Restarting the process loses all accumulated state.
+Axylph runs indefinitely by default unless you tell it to shut down. To do so, finish the sample and save its final profile as JSON with:
 
-## Configuration
+```sh
+axylph finish > result.json
 
-Values resolve in order: command-line option, environment variable, TOML file, then built-in default. Select one file with `--config PATH`, otherwise `AXYLPH_CONFIG`, otherwise `axylph.toml` in the current directory. A missing implicit `axylph.toml` is ignored; an explicitly selected missing or unreadable file is an error. Unknown TOML keys are errors.
+# For a remote server:
+axylph finish --server http://sequencer-backend:50051 > result.json
+```
+
+This ends uploads for the sample. Once the result is saved, stop the server with Ctrl-C. State currently lives in memory, so save before stopping.
+
+## CLI at a glance
+
+The same executable runs both sides of the connection:
+
+```sh
+axylph                       # Start the server using configured settings.
+axylph serve                 # Explicit server mode; equivalent to the above.
+axylph send reads.fastq.gz    # Add reads to the sample.
+axylph finish > result.json  # Finish the sample and save its profile.
+axylph schema > axylph.schema.json
+
+axylph serve --help
+axylph send --help
+axylph finish --help
+```
+
+## Configure a run
+
+Keep reusable settings for the server and clients in `axylph.toml`. All settings are optional; this example uses a reference with `k=31` and minimum `c=50`:
 
 ```toml
+# axylph.toml
 #:schema ./axylph.schema.json
-display = "auto"
 batch_bytes = 1048576
 batch_reads = 1024
 
 [serve]
-sample = "sample-1"
+sample = "run-001"
 listen = "127.0.0.1:50051"
-c = 200
+reference = "references/reference.syldb"
+c = 50
 k = 31
 dedup = true
+profile_workers = 2
+refresh_interval_ms = 1000
 
 [send]
 server = "http://127.0.0.1:50051"
@@ -71,137 +116,52 @@ server = "http://127.0.0.1:50051"
 server = "http://127.0.0.1:50051"
 ```
 
-The schema path is relative to the TOML file. Display mode is selected with `--display auto|plain`, `AXYLPH_DISPLAY`, or the root `display` key, using the precedence above. Profiling is selected with `--reference`, `AXYLPH_REFERENCE`, or `[serve] reference`. A relative reference path from TOML is relative to the selected configuration file's directory; a relative CLI or environment path is relative to the current working directory. Without a reference, the receiver is sketch-only and explicitly setting profiling tuning options is an error.
-
-`--profile-workers`, `AXYLPH_PROFILE_WORKERS`, or `[serve] profile_workers` sets the positive size of the separate profiling worker pool. `--refresh-interval-ms`, `AXYLPH_REFRESH_INTERVAL_MS`, or `[serve] refresh_interval_ms` sets positive minimum refresh start spacing in milliseconds (default 1000). The default profiling pool has two workers when at least two CPUs are available, otherwise one. The CLI's separate async runtime also uses two or one workers by the same rule; neither pool is a whole-process CPU quota.
-
-The other environment variables are `AXYLPH_BATCH_BYTES`, `AXYLPH_BATCH_READS`, `AXYLPH_SAMPLE`, `AXYLPH_LISTEN`, `AXYLPH_C`, `AXYLPH_K`, `AXYLPH_DEDUP`, and `AXYLPH_SERVER`; `AXYLPH_CONFIG` selects the file. Boolean `AXYLPH_DEDUP` accepts `true` or `false`; CLI flags `--dedup` and `--no-dedup` explicitly enable or disable it and conflict with each other.
-
-Bare `axylph` runs `serve`; `axylph send FILE` uses `[send]`. Finish resolves its server independently from `[finish] server`, `AXYLPH_SERVER`, or `--server`, with the usual precedence and default `http://127.0.0.1:50051`; it does not use `[send] server`. Finish needs no sample, reference, or batch settings and rejects explicit serve or batch CLI options. Shared limits and the active command's values are resolved and validated where applicable; inactive command settings are not semantically validated, although the whole file must parse with known keys and correct TOML types. Serve-only CLI options cannot be used with `send`. The JSON Schema checks structure and types, not all runtime constraints; runtime validation is authoritative. Regenerate it with `mise run schema` and check it with `mise run schema-check` (also included in `mise run check`). `axylph schema` prints the schema without loading configuration.
-
-## Input and limits
-
-The client accepts four-line FASTQ records and detects gzip from the file contents. Concatenated gzip members are supported. It preserves the header, sequence letter case, and Phred+33 quality bytes. Sequence symbols must be IUPAC nucleotide letters; quality values must be printable bytes with one value per base. FASTA and wrapped FASTQ are not client inputs in this prototype.
-
-Serve and send accept `--batch-bytes` and `--batch-reads`. Defaults are 1 MiB of identifier/sequence/quality data and 1,024 reads per batch. The supported maxima are 1 MiB and 16,384 reads. One read must fit in a batch. Set the client limits no higher than the receiver limits. There is no total upload size limit.
-
-The client has a one-batch channel and a parser buffer capped at 2 MiB with the default settings. The receiver decodes one batch at a time and permits one active upload. Flight messages are limited to 4 MiB. These are component limits, not a bound on total process memory: Arrow encoding, HTTP/2, and the runtime also use buffers. Marker counts and duplicate history grow with the sample; there is no total sketch-memory limit yet. Validation and sketching run on blocking threads, borrowing sequences from Arrow buffers without creating per-read copies.
-
-The reusable client accepts a blocking `Read` source. Dropping `Client::send` signals cooperative cancellation to the request producer and parser, including a parser waiting for batch-channel capacity. It cannot interrupt an executing `Read::read`; use local files or a source with its own timeout. Once that read returns and cancellation is observed, its bytes are discarded and no subsequent source read is started. Dropping `send` does not wait for the blocking task to finish. Data already handed to the transport may still be accepted, and the receiver may observe request EOF rather than a cancellation status. Cancellation neither rolls back accepted reads nor finalizes the sample.
-
-A peer claiming early completion cannot interrupt a blocked source: `send` may still await the parser to validate the input totals. Callers can impose a timeout by dropping the send future, subject to the same blocking-read limitation. The CLI does not reconnect or resume an upload.
-
-On Unix, receiver SIGINT or SIGTERM stops listening and drains owned ingestion and profiling work before closing connections. Shutdown does not automatically finish the sample, though an already accepted finish is honored. Final notifications are best-effort; external hard termination can interrupt draining and lose in-memory state.
-
-## Native interface
-
-The experimental version 0 schema has three Arrow `Binary` columns: non-null `id`, non-null `sequence`, and nullable `quality`. A null quality means that quality scores are absent. Schema metadata contains `axylph.version = "0"`. One schema precedes the record batches. Dictionaries and IPC compression are rejected in this prototype.
-
-`PutResult.app_metadata` contains JSON with upload-local cumulative `reads`, `bases`, and `complete` fields. Each validated and sketched batch produces a report with `complete: false`. At request EOF, the receiver sends the same counts with `complete: true`. Receiver validation errors and transport errors end the RPC with an error status. Other Flight methods return `UNIMPLEMENTED`.
-
-Protocol validation checks the whole batch before sketch mutation. A malformed batch adds no reads, and later uploads may continue. A scientific counter-limit error can retain complete earlier reads from that batch without emitting a receipt for it; it stops further ingestion, but the accepted sketch remains inspectable. A panic while holding the sketch lock prevents reuse or inspection of potentially inconsistent state. There is no automatic reset.
-
-A local parser error can look like request EOF to the receiver. The receiver can therefore send a completion receipt even though the source file is invalid. The client checks its parser result and input totals before it reports completion; it returns an error in this case. A receiver receipt alone does not prove that the source file was fully read. Flight uploads have no explicit session-finalization message; Session hosts expose a separate HTTP finish operation.
-
-This interface can change before 1.0. Direct HTTP FASTQ uploads, paired-end sketching, durable recovery, and a GUI are not implemented. Gzip support here is for client input; native network traffic is Arrow, not a FASTQ file. Session-based hosts, including profiled CLI receivers, additionally expose the HTTP finish operation described below.
-
-## Observing the sketch
-
-Library callers construct a `sylph::read_sketch::ReadSketcher` with explicit parameters and identity, then pass it to `Receiver::new(limits, sketcher)`. Keep a receiver clone before consuming another handle with `router()`:
-
-```rust
-let receiver = Receiver::new(limits, sketcher);
-let app = receiver.clone().router();
-let marker_count = receiver.inspect(|sketch| sketch.kmer_counts.len()).await?;
-```
-
-Clones share the accumulator and upload gate. `inspect` borrows a consistent processed prefix on a blocking thread; it neither copies the marker map nor resets duplicate history. It can run between batches of a live upload. Pending batches need not appear yet. Return only the owned information needed and keep callbacks short: ingestion waits for the callback's lock. Do not re-enter the receiver from a callback. Dropping the observation future does not stop a submitted callback. No sketch retrieval endpoint is exposed over the network.
-
-`Receiver::ingestion_status()` returns owned, coherent `processed` and `ingestion_error` metadata without copying the sketch or retaining profile rows. These exact processed totals are distinct from sampled marker counts and upload-local receipts. A recorded failure does not discard the accepted prefix.
-
-`Receiver::close_and_drain().await` permanently closes admission across its clones and waits for admitted ingestion, not producer EOF, network delivery, or profiling completion. Repeated calls are safe; cancelling the wait does not reopen admission. For a session-backed receiver this requests shutdown, not finish: an already accepted finish is honored, but closing first prevents a later finish. Use `Session::shutdown()` when analysis must also be awaited. Draining alone does not certify successful ingestion.
-
-## Observing cumulative profiles
-
-A session owns the analysis; its receiver delivers reads to it. Supply a loaded `sylph::profile::Profiler` with fixed references, options, and an explicitly sized local worker pool, then start a fresh sample on your Tokio runtime (with its time driver enabled):
-
-```rust
-let session = Session::builder("sample-1", profiler)
-    .c(50)
-    .start()?;
-let app = session.router(); // Flight uploads, GET /events, and POST /finish.
-let observations = session.observe();
-// Serve app and consume observations on your runtime.
-// When the operator explicitly finishes the sample:
-let final_snapshot = session.finish().await?;
-session.shutdown().await?;
-```
-
-The builder defaults to sylph's `SketchParams::default()` (c=200, k=31, exact deduplication), `Limits::default()`, and one-second minimum spacing between periodic input-capture starts. `.sketch_params(...)` replaces the complete scientific configuration; `.c(...)`, `.k(...)`, and `.deduplication(...)` replace individual fields. Later calls win. `.limits(...)` and `.refresh_interval(...)` override the operational settings. Fully explicit `Session::start(limits, sample_name, sketch_params, profiler, refresh_interval)` uses the same initialization path. Startup rejects incompatible sketch/reference parameters before admitting reads; default c=200 therefore needs overriding for c=50/100 references. It never silently changes scientific settings.
-
-`observe()` returns an owned stream: current state first, then coalesced changes. Pin it when using `StreamExt::next`. Observations expose current processed read/base totals, lifecycle and failure information, and an optional shared snapshot. A snapshot carries its own checkpoint and read-only sylph `Profile`; current progress can be ahead of its coverage. Duplicates and reads contributing no markers still count. Holding an older observation retains its result unchanged, but slow consumers can skip intermediate states. This is not a retained history; `Session::router()` exposes the HTTP adapter described below.
-
-One worker captures a copy of cumulative marker counts and metadata with its checkpoint, then profiles outside the ingestion lock using resident references. It does not copy raw reads, reference genomes, or duplicate history, nor pre-copy pending inputs. An ordinary refresh error preserves the previous snapshot and reports the attempted checkpoint; another automatic attempt requires newer evidence. Before the first success, no profile is available. Refresh eligibility is not a calculation deadline, and large-reference memory use, copy pauses, and sustained throughput have not been characterized.
-
-Periodic eligibility is checked before submitting a capture. Each attempt anchors the next eligible time immediately before copying input under the sketch lock, excluding blocking-pool and lock waits. Success and scientific failure use the same start-spacing policy. There is no additional completion cooldown or queue of missed ticks: a calculation longer than the interval can be followed immediately by another if newer evidence exists. Idle sessions check for new input once per interval, so newly arriving evidence may wait up to an interval before becoming eligible, plus runtime/lock delays. Explicit finish bypasses periodic waiting without bypassing draining or ownership of active work.
-
-`finish()` closes read admission and drains admitted work, then returns a shared profile covering exactly the terminal processed checkpoint. An existing successful snapshot with that coverage is reused; otherwise one required terminal calculation runs. `Observation::finish_outcome()` retains the success or failure after shutdown. Finality belongs to this recorded outcome, not a mutable flag on previously published snapshots. A failed finish keeps admission closed and older results non-final; repeated calls observe the same outcome without retrying. Ingestion errors remain independently visible and a final profile does not prove a successful upload.
-
-`shutdown()` closes read admission, stops periodic scheduling, drains admitted blocking work, and awaits active profiling without waiting for upload EOF. Repeated or cancelled waits do not restart or cancel that work. Dropping the owner requests stopping but cannot await synchronous work. The first terminal request wins: shutdown honors an already accepted finish, but finish after shutdown cannot restart the session. Shutdown alone does not finalize the sample or guarantee a profile covering the last read. Library consumers own their runtime and choose the profiler's worker count; neither count is a whole-process CPU quota.
-
-## HTTP observations and finish
-
-`axylph finish` accepts an HTTP origin only: no TLS, proxy path, credentials, query, or fragment. It waits for the retained outcome without retrying or imposing a short timeout. It buffers and validates the response before writing to stdout, with a 64 MiB response limit. On success it writes the raw JSON (preserving its values); if the result contains an ingestion error, it still writes the JSON, warns on stderr, and exits nonzero. Other errors produce no JSON on stdout.
-
-`Session::router()` serves Flight over HTTP/2, read-only `GET /events`, and `POST /finish` on the same listener, with HTTP/1.1 or HTTP/2 for the latter routes. The CLI exposes these routes when a reference is configured; `Receiver::router()` and the sketch-only CLI remain Flight-only. Library applications must retain their `Session` owner while serving: retaining a router does not keep the worker owner alive, and an SSE disconnect does not stop profiling.
-
-`POST /finish` requires `Content-Type: application/json` and the empty object `{}`. Invalid requests are rejected before closing admission. It awaits the same finish operation as the Rust interface, returning HTTP 200 with the complete `{status, profile}` snapshot on success. A successful profile may still carry an independent `ingestion_error`; it covers accepted evidence, not proof of a complete producer input. The listener remains available after finish, including terminal SSE observations. Repeated finish requests retrieve the retained outcome rather than retrying calculation; disconnected waiters do not cancel an accepted finish. This guarantee lasts only for the current in-memory session, not across process restarts.
-
-Finish failures return `{ "error": { "code": ..., "message": ... } }`: HTTP 409 if shutdown already won, 422 for a scientific profiling failure, and 500 for internal/task failures. Invalid request bodies use 400/415/422 (or 413 for the body limit) with code `invalid_finish_request`. Responses use `Cache-Control: no-store`. No shutdown/reset endpoint or permissive cross-origin policy is installed. This is a trusted-network control operation, not an authenticated endpoint; hosts must supply access control before exposing it outside that environment.
-
-`/events` returns `text/event-stream` with JSON data, keepalive comments, and `Cache-Control: no-store`. Each connection starts with a `snapshot` event containing `{ "status": ..., "profile": ... }`. Later `snapshot` events replace the entire client view when the profile changes; `status` events replace only its metadata. All fields in a message come from one immutable observation. Intermediate observations may be skipped, but a new profile is included before metadata can refer to it. Reconnection starts from current state without replay, event IDs, or a separate initial GET. A `profile: null` clears any previously displayed result; a successful empty profile instead has empty `rows`.
-
-Status contains `sample_name`, `state` (`open`, `stopping`, or `stopped`), `processed`, `profile_checkpoint`, `ingestion_error`, `refresh_error`, and `finish`. Errors are null or objects with a machine-readable `code` and diagnostic `message`; refresh errors also identify the attempted `checkpoint`. Finish is null until an outcome exists, then `{ "status": "succeeded", "checkpoint": ... }` or `{ "status": "failed", "error": ... }`. Stopped state and network EOF do not imply successful finish. Browser clients should close their `EventSource` after receiving stopped state, otherwise normal EventSource reconnection can repeat the terminal view.
-
-Profiles include their checkpoint, sample name, scientific options, and complete replacement rows. Checkpoint read/base totals and observed marker counts are decimal strings, preserving integer precision in browser JSON. Estimates are unrounded numbers: ANI fields end in `_fraction`, taxonomic abundance in `_percent`, and `sequence_estimate` has `kind` (`percent` or `estimated_read_count`) and `value`. `adjustment` distinguishes `lambda` with a value from `low` and `high`. Intervals are two-element arrays or null; the options retain whether intervals were requested. Adjusted ANI is not capped at one on the wire. Consumers choose display rounding and clipping; errors must not be inferred from empty rows or null intervals.
-
-Routine progress-only events are spaced at least 250 ms after the preceding event on each subscription, coalescing pending progress to the latest state. Initial snapshots, new profiles, and error/lifecycle/finish changes bypass that wait, carry current progress, and restart the progress interval. This limits server stream emissions, not network arrival times; backpressure and proxy buffering can delay or bunch deliveries. No queue of old observations is retained. Scientific start spacing is separate from per-subscriber delivery cadence; subscriptions never schedule calculations.
-
-Reconnection, slow-client behavior, HTTP cancellation/races, and scientific failure paths need subsequent focused tests. Profile serialization borrows the scientific rows, but each connection owns its serialized payload; large-payload CPU/memory costs and deployment proxy buffering have not been measured. Authentication, TLS, and cross-origin policy remain the host application's responsibility.
-
-## Development
-
-Use Mise 2026.10.22 or newer. Rust is pinned in `mise.toml` and `rust-toolchain.toml`; keep these versions and the Cargo Rust requirement in sync. Axylph selects sylph's `profile-core` without its CLI or FASTX/file-I/O features, so sylph does not add native compression libraries or a CMake requirement to this build.
+`profile_workers` controls the profiling worker pool; `refresh_interval_ms` sets the minimum spacing between calculations. The root batch limits apply to both uploads and the receiver: combined identifier, sequence, and quality bytes, and reads per batch.
 
 ```sh
-mise trust
-mise install
-mise run check
-mise run ci-validate
+# Use the same file for the server and its clients.
+axylph --config axylph.toml --sample run-001
+axylph send reads.fastq.gz --config axylph.toml
+axylph finish --config axylph.toml > result.json
+
+# Override the configured sample for a new server process.
+AXYLPH_SAMPLE=run-002 axylph --config axylph.toml
+
+# Configure profiling through the process environment.
+AXYLPH_REFERENCE=/data/references/reference.syldb \
+AXYLPH_C=50 \
+AXYLPH_K=31 \
+AXYLPH_PROFILE_WORKERS=2 \
+axylph
+
+# Point either client at a remote server.
+AXYLPH_SERVER=http://sequencer-backend:50051 axylph send reads.fastq.gz
+AXYLPH_SERVER=http://sequencer-backend:50051 axylph finish > result.json
 ```
 
-`check` runs formatting, Clippy, nextest, documentation and schema checks, and doctests when `src/lib.rs` exists. Tests exercise the client/server interface and public Flight input handling. Accumulation, profile-publication, and finish tests use checked-in expectations generated from unchanged upstream revision `1f7fcb53aa20b592d8b3b97f75d9971a60eb06e9`; they do not run the adapted code to generate their oracle. The JSON fixtures record provenance, checksums, and generation environment. The profiling tracers cover 23 synthetic reads and their cumulative profile at CLI precision, including library finality retained after shutdown and a real HTTP/1.1 SSE subscription alongside HTTP/2 Flight on one listener. The SSE tracer checks initial absence and independently expected profile values; it does not establish reconnect or delivery-rate behavior. These checks do not establish unrounded equivalence, overlapping computation/ingestion, lifecycle-race behavior, or large-workload performance. Build and verification tasks use `Cargo.lock` without updating dependencies.
+Command-line arguments override `AXYLPH_*` environment variables, which override TOML settings and defaults. Without `--config`, Axylph uses `AXYLPH_CONFIG` or looks for `axylph.toml` in the invocation directory. Relative reference paths in TOML are resolved from that file's directory; argument and environment paths are relative to the invocation directory.
 
-Controlled-clock internal tests exercise progress coalescing and a lifecycle change bypassing pending progress on the real SSE response body with a controlled observation source. They establish server emission eligibility at the 250 ms boundary, not TCP arrival spacing or scientific scheduling. The end-to-end tracer remains the independent transport/scientific check.
+Other environment overrides are `AXYLPH_LISTEN`, `AXYLPH_REFRESH_INTERVAL_MS`, `AXYLPH_DEDUP` (`true` or `false`), `AXYLPH_BATCH_BYTES`, `AXYLPH_BATCH_READS`, and `AXYLPH_DISPLAY` (the root TOML `display` setting). Axylph reads the process environment rather than loading `.env` files. Generate the schema with `axylph schema > axylph.schema.json` to enable editor validation using the comment above.
 
-A real Flight-to-HTTP finish tracer rejects invalid control requests without closing admission, checks the terminal prefix-23 profile against the independent oracle, repeats finish, and reads the same terminal snapshot over SSE while the listener stays available. It does not prove concurrent finish/shutdown ordering, disconnected waiter behavior, or scientific failure handling over HTTP.
+## Roadmap
 
-A separate internal cadence test checks periodic eligibility from supplied capture-start times, including a calculation longer than its interval, a later short calculation, and idle polling. It does not instrument actual capture starts or establish end-to-end timing; timestamp placement and worker wiring are separately reviewed. These are policy correctness tests, not performance measurements.
+The next two priorities are:
 
-`.gitignore` denies files by default. Add each source, test, or configuration file to its allowlist when it should be tracked. Keep imports from the same root in one `use` statement.
+1. **Automatically send new FASTQ files.** Watch instrument or basecaller output directories, identify completed files, and queue them for upload.
+2. **Change references without restarting.** Attach, replace, or remove a reference on a running server, and profile the same compatible sample evidence against different databases.
 
-Library errors use `axylph::Error`, defined with `thiserror` in `src/error.rs`; session finish and shutdown share errors through `Arc<Error>` so repeated callers can observe the same failure. Application failures have named variants; dependency failures wrap their source errors. The CLI installs `color-eyre` for reporting and adds file or address context. Library callers do not need to install a reporting handler.
+Further work on the roadmap, with scope and ordering still open:
 
-Dependencies serve specific roles: Arrow and Flight handle structured reads and IPC, Tonic and Axum serve HTTP/2, and Tokio plus stream adapters provide bounded asynchronous transfer. `seq_io` bounds FASTQ parsing; `flate2` handles gzip, including concatenated members, with its Rust backend. Serde and JSON encode the progress wire format. Clap handles CLI parsing and help. Sylph owns the scientific algorithm, sketch types, and public profile representation; only its embeddable profiling capability is enabled, not CLI, file readers, or native compression. Replacing these libraries means taking on their behavior and maintenance, not just removing package names. Optional tracing-span capture in `color-eyre` is disabled because the application does not set up tracing spans.
+- **Show leading profile hits in the terminal.** Extend the HUD beyond progress counts to preview results as they develop.
+- **Expose richer profiling activity.** Let dashboards and library callers distinguish input receipt, in-progress profiling, and finished results.
+- **Recover sessions after a restart.** Explore preserving enough evidence and analysis state to resume interrupted runs safely.
+- **Manage memory for larger runs.** Measure reference and sample memory costs, then design useful budgets and admission controls.
+- **Strengthen the library and diagnostics.** Review internal API boundaries and naming, improve failure messages, and extend panic-prone unwrap checks to tests.
 
-Use `mise run bc`, `mise run bb`, or `mise run bn` to watch checks, builds, or tests with Bacon. Mise enables mr-boxington for Rust builds. Use `mise run mt` to inspect its activity. These settings do not by themselves prove cache hits.
+These are planned directions rather than available features. Reference sketch generation may be explored alongside runtime reference management; its scope is still undecided.
 
-## Upstream reference
+## Sylph fork
 
-```sh
-mise bootstrap repos apply
-```
+**Axylph currently uses [our Sylph fork](https://github.com/nrminor/sylph).** Its exact revision is pinned in `Cargo.toml` and `Cargo.lock`.
 
-This clones unchanged upstream sylph into `.agents/repos/sylph` for source reference. Builds fetch the maintained fork at `https://github.com/nrminor/sylph`, pinned to published revision `1c9ec8658c5566a424a97fda2512b2a332dabf2c` with default features disabled and `profile-core` enabled. `Cargo.lock` records that Git source; no local Cargo patch or reference checkout is required to build. Planning notes and research checkouts remain local.
-
-The fork preserves upstream CPU dispatch. At this revision AVX2 extraction omits up to three trailing windows that scalar extraction includes. The scientific fixtures avoid sampled omitted windows; passing them is not a general scalar/AVX2 equivalence claim. Axylph has not changed this extraction behavior. Exact deduplication also retains sylph's signature-eligibility and count-four rules; it does not suppress every repeated read forever.
+The fork makes Sylph's sketch accumulation and profiling available as reusable library interfaces, so Axylph can accept new reads and profile them while keeping references loaded. It shares calculation code with the Sylph CLI; the fork provides the service integration that makes this workflow possible.
